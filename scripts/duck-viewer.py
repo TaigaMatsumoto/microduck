@@ -422,6 +422,11 @@ def main() -> None:
         i = args.index("--mujoco-dist")
         mujoco_dist = Path(args[i + 1])
         del args[i:i + 2]
+    usdz_url = ""
+    if "--usdz-url" in args:
+        i = args.index("--usdz-url")
+        usdz_url = args[i + 1]
+        del args[i:i + 2]
     mjcf = Path(args.pop(0)).expanduser() if args and args[0].endswith(".xml") else None
     out_path = Path(args[0]) if args else Path(__file__).parent / "duck-viewer.html"
 
@@ -458,6 +463,9 @@ def main() -> None:
     html = html.replace("__DIMS_NOTE__", dims_note)
     html = html.replace("__MUJOCO_GLUE__", glue)
     html = html.replace("__SIM_ASSETS__", sim_assets)
+    # --usdz-url: absolute URL of a bake-duck-usdz.py output; shows the iPhone
+    # AR Quick Look button. Empty keeps the button hidden.
+    html = html.replace("__USDZ_URL__", usdz_url)
     # A visible build tag (in the AR診断 line) so "which version am I looking
     # at?" is answerable from a phone screenshot.
     import datetime
@@ -639,7 +647,12 @@ TEMPLATE = r"""<meta charset="utf-8">
   .simbtn:active, .simbtn.held, .simbtn[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
   .simbtn.wide { grid-column: span 3; }
   #simpanel .hintline { color: var(--muted); font-size: 11px; margin: 8px 0 2px; }
-  #ar-escape a.simbtn { display: block; text-align: center; text-decoration: none; margin: 6px 0; }
+  .barbtns { display: flex; gap: 6px; align-items: center; }
+  #minictrl { display: flex; gap: 4px; }
+  .simbtn.mini { padding: 4px 9px; font-size: 12px; border-radius: 6px; }
+  #simpanel.collapsed { width: auto; }
+  #simpanel.collapsed .body, #simpanel.collapsed #simtitle, #simpanel.collapsed #simreset { display: none; }
+  a.simbtn { display: block; text-align: center; text-decoration: none; margin: 6px 0; }
   .urlrow { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
   #ar-url {
     flex: 1; min-width: 0; font-family: "IBM Plex Mono", monospace; font-size: 10.5px;
@@ -706,8 +719,17 @@ TEMPLATE = r"""<meta charset="utf-8">
 
 <div class="panel" id="simpanel">
   <div class="bar">
-    <h2>歩行シミュレーション</h2>
-    <button class="chip-reset" id="simreset">リセット</button>
+    <h2 id="simtitle">歩行シミュレーション</h2>
+    <div class="barbtns">
+      <span id="minictrl" hidden>
+        <button class="simbtn mini" data-cmd="turnl" aria-label="左旋回">⟲</button>
+        <button class="simbtn mini" data-cmd="fwd" aria-label="前進">▲</button>
+        <button class="simbtn mini" data-cmd="turnr" aria-label="右旋回">⟳</button>
+        <button class="simbtn mini" data-cmd="stop" aria-label="停止">■</button>
+      </span>
+      <button class="chip-reset" id="simreset">リセット</button>
+      <button class="chip-reset" id="simmin" aria-label="パネルを最小化" aria-expanded="true">－</button>
+    </div>
   </div>
   <div class="body">
     <div id="simstatus">
@@ -732,6 +754,7 @@ TEMPLATE = r"""<meta charset="utf-8">
       <button class="simbtn" id="ar-photo" aria-pressed="false">写真</button>
       <button class="simbtn" id="ar-cam" aria-pressed="false">ライブ</button>
       <button class="simbtn wide" id="ar-off" aria-pressed="true">AR オフ</button>
+      <a class="simbtn wide" id="ar-usdz" rel="ar" hidden>iPhone AR — 実寸で床に置く（Quick Look）</a>
       <button class="simbtn wide" id="ar-open" hidden>別タブで開く（ライブカメラ用）</button>
       <button class="simbtn wide" id="ar-xr" hidden>WebXR AR（実寸でその場に置く）</button>
       <button class="simbtn wide" id="ar-grid" aria-pressed="true">床グリッド表示</button>
@@ -1482,6 +1505,33 @@ arGridBtn.addEventListener("click", () => {
   const showGrid = arMode === "off" || on;
   gridMajor.visible = showGrid;
   gridMinor.visible = showGrid;
+});
+
+// ---- iPhone AR (Quick Look) -------------------------------------------------
+// iOS has no WebXR; instead a usdz with the walk baked in (scripts/
+// bake-duck-usdz.py) opens in the native AR viewer at true scale.
+const USDZ_URL = "__USDZ_URL__";
+{
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const a = document.getElementById("ar-usdz");
+  if (USDZ_URL && isIOS) {
+    a.hidden = false;
+    a.href = USDZ_URL;
+  }
+}
+
+// ---- panel minimize ---------------------------------------------------------
+// Small screens are exactly where the AR modes run; the folded bar keeps
+// drive/turn/stop reachable while the picture stays visible.
+const simMin = document.getElementById("simmin");
+simMin.addEventListener("click", () => {
+  const panel = document.getElementById("simpanel");
+  const collapsed = panel.classList.toggle("collapsed");
+  document.getElementById("minictrl").hidden = !collapsed;
+  simMin.textContent = collapsed ? "＋" : "－";
+  simMin.setAttribute("aria-expanded", String(!collapsed));
+  simMin.setAttribute("aria-label", collapsed ? "パネルを開く" : "パネルを最小化");
 });
 
 // ---- WebXR AR (hit-test placement, true scale) ------------------------------
