@@ -717,13 +717,16 @@ TEMPLATE = r"""<meta charset="utf-8">
     <div id="fallnote">転倒！ 指令を止めて自動復帰中…</div>
     <h3>AR合成</h3>
     <div class="padgrid">
-      <button class="simbtn" id="ar-cam" aria-pressed="false">カメラ</button>
+      <button class="simbtn" id="ar-shot" aria-pressed="false">撮影</button>
       <button class="simbtn" id="ar-photo" aria-pressed="false">写真</button>
-      <button class="simbtn" id="ar-off" aria-pressed="true">オフ</button>
+      <button class="simbtn" id="ar-cam" aria-pressed="false">ライブ</button>
+      <button class="simbtn wide" id="ar-off" aria-pressed="true">AR オフ</button>
       <button class="simbtn wide" id="ar-xr" hidden>WebXR AR（実寸でその場に置く）</button>
       <button class="simbtn wide" id="ar-grid" aria-pressed="true">床グリッド表示</button>
     </div>
     <input type="file" id="ar-file" accept="image/*" hidden>
+    <input type="file" id="ar-capture" accept="image/*" capture="environment" hidden>
+    <div class="hintline">撮影＝その場でカメラ撮影して重ねる（権限不要・スマホ推奨） ／ 写真＝保存済み画像 ／ ライブ＝カメラ映像（ブラウザの権限が必要）</div>
     <div class="hintline" id="ar-hint" style="display:none">端末や写真を固定し、ドラッグ／ホイールで視点を実写の床に合わせてください。グリッドが合ったら非表示に。</div>
     <h3>頭コマンド</h3>
     <div id="head-rows"></div>
@@ -1361,22 +1364,38 @@ function applyAr(mode) {
   const showGrid = !on || arGridBtn.getAttribute("aria-pressed") === "true";
   gridMajor.visible = showGrid;
   gridMinor.visible = showGrid;
-  for (const id of ["ar-cam", "ar-photo", "ar-off"]) {
-    document.getElementById(id).setAttribute("aria-pressed",
-      String(id === "ar-" + (mode === "off" ? "off" : mode === "cam" ? "cam" : "photo")));
-  }
+  document.getElementById("ar-cam").setAttribute("aria-pressed", String(mode === "cam"));
+  document.getElementById("ar-photo").setAttribute("aria-pressed", String(mode === "photo"));
+  document.getElementById("ar-shot").setAttribute("aria-pressed", String(mode === "photo"));
+  document.getElementById("ar-off").setAttribute("aria-pressed", String(mode === "off"));
   applyTheme();
 }
 
 document.getElementById("ar-cam").addEventListener("click", async () => {
   if (arMode === "cam") return;
+  arHint.style.display = "none";
+  const fail = (msg) => {
+    arHint.style.display = "block";
+    arHint.textContent = msg + " 「撮影」ならカメラアプリで撮った写真にすぐ重ねられます（権限不要）。";
+  };
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    fail("このブラウザ／表示ではライブカメラAPIを使えません。");
+    return;
+  }
   try {
     camStream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: "environment" } }, audio: false,
     });
   } catch (e) {
-    arHint.style.display = "block";
-    arHint.textContent = "カメラを起動できませんでした（権限またはブラウザ制限）。「写真」で撮った画像に重ねることもできます。";
+    // The artifact page runs inside an embedding frame; hosts that don't grant
+    // the camera permission make getUserMedia fail no matter what the user taps.
+    if (e && (e.name === "NotAllowedError" || e.name === "SecurityError")) {
+      fail("カメラ権限が許可されませんでした。この埋め込み表示ではライブカメラがブロックされている場合があります。");
+    } else if (e && e.name === "NotFoundError") {
+      fail("カメラデバイスが見つかりませんでした。");
+    } else {
+      fail(`カメラを起動できませんでした（${e && e.name || "エラー"}）。`);
+    }
     return;
   }
   arVideo.srcObject = camStream;
@@ -1386,13 +1405,21 @@ document.getElementById("ar-cam").addEventListener("click", async () => {
 document.getElementById("ar-photo").addEventListener("click", () => {
   document.getElementById("ar-file").click();
 });
-document.getElementById("ar-file").addEventListener("change", (e) => {
+// 撮影: a capture-flagged file input opens the camera app directly on phones —
+// no getUserMedia, no permission prompt an embedding frame can strip away.
+document.getElementById("ar-shot").addEventListener("click", () => {
+  document.getElementById("ar-capture").click();
+});
+function useArPicture(e) {
   const file = e.target.files && e.target.files[0];
   if (!file) return;
   if (arImg.src.startsWith("blob:")) URL.revokeObjectURL(arImg.src);
   arImg.src = URL.createObjectURL(file);
+  e.target.value = ""; // let the same picture be re-picked later
   applyAr("photo");
-});
+}
+document.getElementById("ar-file").addEventListener("change", useArPicture);
+document.getElementById("ar-capture").addEventListener("change", useArPicture);
 document.getElementById("ar-off").addEventListener("click", () => applyAr("off"));
 arGridBtn.addEventListener("click", () => {
   const on = arGridBtn.getAttribute("aria-pressed") !== "true";
