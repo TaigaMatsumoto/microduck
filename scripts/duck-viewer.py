@@ -520,11 +520,16 @@ TEMPLATE = r"""<meta charset="utf-8">
     font-size: 14px;
     overflow: hidden;
   }
-  #stage { position: fixed; inset: 0; display: block; touch-action: none; cursor: grab; }
+  #arlayer { position: fixed; inset: 0; z-index: 0; display: none; background: #000; }
+  #arlayer video, #arlayer img {
+    width: 100%; height: 100%; object-fit: cover; display: none;
+  }
+  #stage { position: fixed; inset: 0; z-index: 1; display: block; touch-action: none; cursor: grab; }
   #stage:active { cursor: grabbing; }
 
   .panel {
     position: fixed;
+    z-index: 5;
     background: var(--surface);
     border: 1px solid var(--surface-border);
     border-radius: 10px;
@@ -627,7 +632,7 @@ TEMPLATE = r"""<meta charset="utf-8">
     border-radius: 8px; padding: 9px 4px; cursor: pointer;
     user-select: none; -webkit-user-select: none; touch-action: none;
   }
-  .simbtn:active, .simbtn.held { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .simbtn:active, .simbtn.held, .simbtn[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
   .simbtn.wide { grid-column: span 3; }
   #simpanel .hintline { color: var(--muted); font-size: 11px; margin: 8px 0 2px; }
   #fallnote {
@@ -653,6 +658,10 @@ TEMPLATE = r"""<meta charset="utf-8">
   }
 </style>
 
+<div id="arlayer">
+  <video id="arvideo" playsinline muted autoplay></video>
+  <img id="arimg" alt="AR背景">
+</div>
 <canvas id="stage"></canvas>
 
 <div class="panel" id="head">
@@ -706,6 +715,16 @@ TEMPLATE = r"""<meta charset="utf-8">
       <button class="simbtn wide" data-cmd="push">押す（いたずら）</button>
     </div>
     <div id="fallnote">転倒！ 指令を止めて自動復帰中…</div>
+    <h3>AR合成</h3>
+    <div class="padgrid">
+      <button class="simbtn" id="ar-cam" aria-pressed="false">カメラ</button>
+      <button class="simbtn" id="ar-photo" aria-pressed="false">写真</button>
+      <button class="simbtn" id="ar-off" aria-pressed="true">オフ</button>
+      <button class="simbtn wide" id="ar-xr" hidden>WebXR AR（実寸でその場に置く）</button>
+      <button class="simbtn wide" id="ar-grid" aria-pressed="true">床グリッド表示</button>
+    </div>
+    <input type="file" id="ar-file" accept="image/*" hidden>
+    <div class="hintline" id="ar-hint" style="display:none">端末や写真を固定し、ドラッグ／ホイールで視点を実写の床に合わせてください。グリッドが合ったら非表示に。</div>
     <h3>頭コマンド</h3>
     <div id="head-rows"></div>
     <div class="hintline">キー操作: W/↑ 前進 ・ A/D 横移動 ・ ←/→ 旋回 ・ Space 停止</div>
@@ -781,12 +800,14 @@ function parseDuck(bytes) {
 const canvas = document.getElementById("stage");
 let renderer;
 try {
-  renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  // alpha: the AR modes composite the scene over a camera feed or photo.
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
 } catch (e) {
   document.getElementById("fallback").style.display = "grid";
   throw e;
 }
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(32, 1, 0.01, 40);
@@ -795,12 +816,14 @@ scene.add(new THREE.HemisphereLight(0xffffff, 0x8899aa, 0.85));
 const sun = new THREE.DirectionalLight(0xffffff, 0.75);
 sun.position.set(0.6, 1.2, 0.8);
 scene.add(sun);
+scene.add(sun.target);
 const fill = new THREE.DirectionalLight(0xffffff, 0.25);
 fill.position.set(-0.8, 0.4, -0.6);
 scene.add(fill);
 
 // Grids live in Three's y-up world; the robot group is rotated from MJCF z-up.
 const themed = []; // objects recoloured/redrawn when the theme flips
+let arMode = "off"; // "off" | "cam" | "photo" — the sim's AR compositing mode
 function cssColor(name) {
   return new THREE.Color(getComputedStyle(document.documentElement).getPropertyValue(name).trim());
 }
@@ -816,7 +839,8 @@ function buildGrids(span) {
 }
 
 function applyTheme() {
-  renderer.setClearColor(cssColor("--bg"));
+  // In an AR mode the canvas is transparent and the camera feed shows through.
+  renderer.setClearColor(cssColor("--bg"), arMode === "off" ? 1 : 0);
   if (gridMajor) {
     gridMajor.material.color = cssColor("--grid-major");
     gridMinor.material.color = cssColor("--grid-minor");
@@ -830,9 +854,28 @@ buildGrids(0.6);
 // ---- robot ------------------------------------------------------------------
 const duck = parseDuck(await gunzip(DUCK_GZ));
 
+// simWorld is the placeable origin: WebXR AR moves it onto a real surface, and
+// everything that must land there with the duck (its contact shadow) rides in it.
+const simWorld = new THREE.Group();
+scene.add(simWorld);
+
 const robotRoot = new THREE.Group();
 robotRoot.rotation.x = -Math.PI / 2; // MJCF z-up → Three y-up
-scene.add(robotRoot);
+simWorld.add(robotRoot);
+
+// Contact shadow for the AR composite: an invisible plane that only shows shade.
+const shadowPlane = new THREE.Mesh(
+  new THREE.PlaneGeometry(4, 4),
+  new THREE.ShadowMaterial({ opacity: 0.3 }),
+);
+shadowPlane.rotation.x = -Math.PI / 2;
+shadowPlane.receiveShadow = true;
+shadowPlane.visible = false;
+simWorld.add(shadowPlane);
+sun.shadow.mapSize.set(1024, 1024);
+sun.shadow.camera.left = -0.8; sun.shadow.camera.right = 0.8;
+sun.shadow.camera.top = 0.8; sun.shadow.camera.bottom = -0.8;
+sun.shadow.camera.near = 0.1; sun.shadow.camera.far = 5;
 
 const geometries = duck.meshes.map(({ verts, faces }) => {
   let g = new THREE.BufferGeometry();
@@ -864,6 +907,7 @@ for (const p of duck.parts) {
   }
   (p.inner ? innerMats : outerMats).push(mat);
   const mesh = new THREE.Mesh(geometries[p.mesh], mat);
+  mesh.castShadow = true; // only drawn once shadowMap is enabled (AR modes)
   mesh.position.set(...p.pos);
   mesh.quaternion.set(p.quat[1], p.quat[2], p.quat[3], p.quat[0]);
   bodyGroups[p.body].add(mesh);
@@ -1280,6 +1324,172 @@ document.getElementById("simreset").addEventListener("click", () => {
   }
 }
 
+// ---- AR compositing ---------------------------------------------------------
+// "cam"/"photo" put a live camera feed or a picked picture behind a transparent
+// canvas: a fixed-shot composite the user lines up by hand (the hint says how).
+// WebXR AR, where the device supports it, is the real thing: hit-test finds a
+// surface, a tap drops the duck there at true scale.
+const arLayer = document.getElementById("arlayer");
+const arVideo = document.getElementById("arvideo");
+const arImg = document.getElementById("arimg");
+const arHint = document.getElementById("ar-hint");
+const arGridBtn = document.getElementById("ar-grid");
+let camStream = null;
+
+function setShadows(on) {
+  shadowPlane.visible = on;
+  if (renderer.shadowMap.enabled !== on) {
+    renderer.shadowMap.enabled = on;
+    sun.castShadow = on;
+    for (const m of [...outerMats, ...innerMats]) m.needsUpdate = true;
+  }
+}
+
+function applyAr(mode) {
+  arMode = mode;
+  const on = mode !== "off";
+  arLayer.style.display = on ? "block" : "none";
+  arVideo.style.display = mode === "cam" ? "block" : "none";
+  arImg.style.display = mode === "photo" ? "block" : "none";
+  arHint.style.display = on ? "block" : "none";
+  if (mode !== "cam" && camStream) {
+    for (const t of camStream.getTracks()) t.stop();
+    camStream = null;
+    arVideo.srcObject = null;
+  }
+  setShadows(on);
+  const showGrid = !on || arGridBtn.getAttribute("aria-pressed") === "true";
+  gridMajor.visible = showGrid;
+  gridMinor.visible = showGrid;
+  for (const id of ["ar-cam", "ar-photo", "ar-off"]) {
+    document.getElementById(id).setAttribute("aria-pressed",
+      String(id === "ar-" + (mode === "off" ? "off" : mode === "cam" ? "cam" : "photo")));
+  }
+  applyTheme();
+}
+
+document.getElementById("ar-cam").addEventListener("click", async () => {
+  if (arMode === "cam") return;
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" } }, audio: false,
+    });
+  } catch (e) {
+    arHint.style.display = "block";
+    arHint.textContent = "カメラを起動できませんでした（権限またはブラウザ制限）。「写真」で撮った画像に重ねることもできます。";
+    return;
+  }
+  arVideo.srcObject = camStream;
+  try { await arVideo.play(); } catch {}
+  applyAr("cam");
+});
+document.getElementById("ar-photo").addEventListener("click", () => {
+  document.getElementById("ar-file").click();
+});
+document.getElementById("ar-file").addEventListener("change", (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  if (arImg.src.startsWith("blob:")) URL.revokeObjectURL(arImg.src);
+  arImg.src = URL.createObjectURL(file);
+  applyAr("photo");
+});
+document.getElementById("ar-off").addEventListener("click", () => applyAr("off"));
+arGridBtn.addEventListener("click", () => {
+  const on = arGridBtn.getAttribute("aria-pressed") !== "true";
+  arGridBtn.setAttribute("aria-pressed", String(on));
+  const showGrid = arMode === "off" || on;
+  gridMajor.visible = showGrid;
+  gridMinor.visible = showGrid;
+});
+
+// ---- WebXR AR (hit-test placement, true scale) ------------------------------
+const xrBtn = document.getElementById("ar-xr");
+let xrHitSource = null;
+let xrPlaced = false;
+const reticle = new THREE.Mesh(
+  new THREE.RingGeometry(0.05, 0.065, 40),
+  new THREE.MeshBasicMaterial({ color: 0xf0a82a, side: THREE.DoubleSide }),
+);
+reticle.rotation.x = -Math.PI / 2;
+reticle.matrixAutoUpdate = false;
+reticle.visible = false;
+scene.add(reticle);
+
+if (navigator.xr && SIM_ASSETS) {
+  navigator.xr.isSessionSupported("immersive-ar")
+    .then((ok) => { if (ok) xrBtn.hidden = false; })
+    .catch(() => {});
+}
+// Taps on the DOM-overlaid panel must not double as placement taps.
+document.getElementById("simpanel").addEventListener("beforexrselect", (e) => e.preventDefault());
+xrBtn.addEventListener("click", async () => {
+  try {
+    const session = await navigator.xr.requestSession("immersive-ar", {
+      requiredFeatures: ["hit-test"],
+      optionalFeatures: ["dom-overlay"],
+      domOverlay: { root: document.getElementById("simpanel") },
+    });
+    applyAr("off");
+    renderer.xr.enabled = true;
+    renderer.xr.setReferenceSpaceType("local");
+    await renderer.xr.setSession(session);
+    const viewer = await session.requestReferenceSpace("viewer");
+    xrHitSource = await session.requestHitTestSource({ space: viewer });
+    xrPlaced = false;
+    gridMajor.visible = false;
+    gridMinor.visible = false;
+    setShadows(true);
+    session.addEventListener("select", () => {
+      if (reticle.visible) {
+        simWorld.position.setFromMatrixPosition(reticle.matrix);
+        if (!xrPlaced && sim) { sim.reset(); simDistance = 0; lastSimPos = null; }
+        else if (sim) {
+          // Re-placing after a walk: land the duck itself on the reticle, not
+          // the origin it wandered away from (MJCF z-up → world x, -z).
+          simWorld.position.x -= sim.qpos[0];
+          simWorld.position.z -= -sim.qpos[1];
+        }
+        xrPlaced = true;
+      } else if (xrPlaced && !session.domOverlayState) {
+        // No DOM overlay to press buttons on: tapping toggles forward walking.
+        if (held.has("fwd")) held.delete("fwd"); else held.add("fwd");
+        computeTarget();
+      }
+    });
+    session.addEventListener("end", () => {
+      renderer.xr.enabled = false;
+      xrHitSource = null;
+      reticle.visible = false;
+      simWorld.position.set(0, 0, 0);
+      setShadows(arMode !== "off");
+      gridMajor.visible = true;
+      gridMinor.visible = true;
+      resize();
+      placeCamera();
+    });
+  } catch (e) {
+    xrBtn.textContent = "WebXR ARを開始できませんでした";
+    console.error(e);
+  }
+});
+
+function xrFrameUpdate(frame) {
+  if (!frame || !xrHitSource) return;
+  const hits = frame.getHitTestResults(xrHitSource);
+  if (hits.length) {
+    const pose = hits[0].getPose(renderer.xr.getReferenceSpace());
+    if (pose) {
+      reticle.visible = !xrPlaced || !held.size; // once walking, stop flashing it
+      reticle.matrix.fromArray(pose.transform.matrix);
+      if (!xrPlaced) {
+        simWorld.position.setFromMatrixPosition(reticle.matrix);
+      }
+    }
+  } else {
+    reticle.visible = false;
+  }
+}
+
 let simInitPromise = null;
 simToggle.addEventListener("click", async () => {
   const on = simToggle.getAttribute("aria-pressed") !== "true";
@@ -1311,6 +1521,9 @@ simToggle.addEventListener("click", async () => {
     simDistance = 0; lastSimPos = null;
     simAccum = 0; simPrev = null;
   } else {
+    applyAr("off");
+    const xrSession = renderer.xr.getSession && renderer.xr.getSession();
+    if (xrSession) xrSession.end().catch(() => {});
     // Back to the assy view: home pose at the origin.
     for (const s of sliders) { angles[s.idx] = parseFloat(s.input.value); }
     bodyGroups[0].position.set(...duck.bodies[0].pos);
@@ -1364,11 +1577,25 @@ function simFrame(now) {
   trunk.position.set(qpos[0], qpos[1], qpos[2]);
   trunk.quaternion.set(qpos[4], qpos[5], qpos[6], qpos[3]);
 
-  // Camera follows the duck (MJCF z-up → world: x→x, z→y, y→-z).
-  target.x += (qpos[0] - target.x) * 0.08;
-  target.y += (qpos[2] - target.y) * 0.08;
-  target.z += (-qpos[1] - target.z) * 0.08;
-  placeCamera();
+  // Camera follows the duck (MJCF z-up → world: x→x, z→y, y→-z) — but not in
+  // the AR modes, where the camera must hold still against a fixed background
+  // (or is the device's own pose under WebXR).
+  if (arMode === "off" && !renderer.xr.isPresenting) {
+    target.x += (qpos[0] - target.x) * 0.08;
+    target.y += (qpos[2] - target.y) * 0.08;
+    target.z += (-qpos[1] - target.z) * 0.08;
+    placeCamera();
+  }
+  // Keep the shadow (and its light frustum) centred on the walking duck. The
+  // plane is a child of simWorld; the light lives in the scene, so it needs
+  // the simWorld offset (WebXR placement) added on.
+  if (renderer.shadowMap.enabled) {
+    shadowPlane.position.set(qpos[0], 0.001, -qpos[1]);
+    const wx = simWorld.position.x + qpos[0], wz = simWorld.position.z - qpos[1];
+    sun.position.set(wx + 0.6, simWorld.position.y + 1.2, wz + 0.8);
+    sun.target.position.set(wx, simWorld.position.y, wz);
+    sun.target.updateMatrixWorld();
+  }
 
   // Status readout: body-frame forward speed and yaw rate, plus odometer.
   const w = qpos[3], x = qpos[4], y = qpos[5], z = qpos[6];
@@ -1394,7 +1621,8 @@ resize();
 applyTheme();
 pose();
 placeCamera();
-renderer.setAnimationLoop((now) => {
+renderer.setAnimationLoop((now, frame) => {
+  if (renderer.xr.isPresenting) xrFrameUpdate(frame);
   if (simActive && sim) simFrame(now);
   else simPrev = null;
   renderer.render(scene, camera);
