@@ -721,6 +721,7 @@ TEMPLATE = r"""<meta charset="utf-8">
       <button class="simbtn" id="ar-photo" aria-pressed="false">写真</button>
       <button class="simbtn" id="ar-cam" aria-pressed="false">ライブ</button>
       <button class="simbtn wide" id="ar-off" aria-pressed="true">AR オフ</button>
+      <button class="simbtn wide" id="ar-open" hidden>別タブで開く（ライブカメラ用）</button>
       <button class="simbtn wide" id="ar-xr" hidden>WebXR AR（実寸でその場に置く）</button>
       <button class="simbtn wide" id="ar-grid" aria-pressed="true">床グリッド表示</button>
     </div>
@@ -1371,6 +1372,27 @@ function applyAr(mode) {
   applyTheme();
 }
 
+// The page is usually viewed inside an embedding frame that doesn't grant the
+// camera permission — there getUserMedia can never succeed. But the artifact
+// is served from its own origin, so its own URL opened as a top-level tab CAN
+// prompt for the camera. The 別タブ button is that escape hatch.
+const embedded = (() => { try { return window.self !== window.top; } catch { return true; } })();
+const arOpen = document.getElementById("ar-open");
+if (embedded) arOpen.hidden = false;
+arOpen.addEventListener("click", async () => {
+  const w = window.open(location.href, "_blank");
+  if (!w) {
+    // Pop-up blocked (or the sandbox forbids it): hand over the URL instead.
+    let copied = false;
+    try { await navigator.clipboard.writeText(location.href); copied = true; } catch {}
+    arHint.style.display = "block";
+    arHint.textContent = (copied
+      ? "このページのURLをコピーしました。"
+      : `このURLをコピーしてください: ${location.href} `)
+      + "SafariやChromeで直接開くと、ライブカメラの許可ダイアログを出せます。";
+  }
+});
+
 document.getElementById("ar-cam").addEventListener("click", async () => {
   if (arMode === "cam") return;
   arHint.style.display = "none";
@@ -1379,7 +1401,9 @@ document.getElementById("ar-cam").addEventListener("click", async () => {
     arHint.textContent = msg + " 「撮影」ならカメラアプリで撮った写真にすぐ重ねられます（権限不要）。";
   };
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    fail("このブラウザ／表示ではライブカメラAPIを使えません。");
+    fail(embedded
+      ? "この埋め込み表示ではライブカメラAPIを使えません。「別タブで開く」から単独ページとして開くと使えます。"
+      : "このブラウザではライブカメラAPIを使えません。");
     return;
   }
   try {
@@ -1387,10 +1411,10 @@ document.getElementById("ar-cam").addEventListener("click", async () => {
       video: { facingMode: { ideal: "environment" } }, audio: false,
     });
   } catch (e) {
-    // The artifact page runs inside an embedding frame; hosts that don't grant
-    // the camera permission make getUserMedia fail no matter what the user taps.
     if (e && (e.name === "NotAllowedError" || e.name === "SecurityError")) {
-      fail("カメラ権限が許可されませんでした。この埋め込み表示ではライブカメラがブロックされている場合があります。");
+      fail(embedded
+        ? "埋め込み表示のためカメラ権限が下りませんでした。上の「別タブで開く」から単独ページとして開き、もう一度「ライブ」を押してください。"
+        : "カメラ権限が拒否されています。iPhoneのSafariでは、アドレスバー左の「ぁあ」→「Webサイトの設定」→「カメラ」を「許可」にしてください。");
     } else if (e && e.name === "NotFoundError") {
       fail("カメラデバイスが見つかりませんでした。");
     } else {
