@@ -279,6 +279,9 @@ def build_usdz(bodies, files, mesh_dir: Path, frames, out_path: Path) -> None:
             prim.CreateNormalsAttr(Vt.Vec3fArray.FromNumpy(np.repeat(n, 3, axis=0).astype(np.float32)))
             prim.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
             prim.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+            # CAD STL winding is not consistent; Quick Look culls back faces by
+            # default, which shows up as holes in the shells. Draw both sides.
+            prim.CreateDoubleSidedAttr(True)
             prim.CreateDisplayColorAttr([Gf.Vec3f(*[float(c) for c in p["rgba"][:3]])])
             UsdShade.MaterialBindingAPI.Apply(prim.GetPrim()).Bind(material(p["rgba"]))
 
