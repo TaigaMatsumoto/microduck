@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Emit a standalone HTML viewer of the robot's assembly model.
+"""Emit a standalone HTML viewer of the robot's assembly model — optionally with a
+physics simulation the robot's real policies can walk around in.
 
 The page is a self-contained web view of the robot: a Three.js scene with orbit
 controls, a centimetre grid and ruler, real-world scale references (a drink can,
@@ -7,24 +8,43 @@ a bottle, a phone), an x-ray mode that reveals the parts inside the shells, and
 per-joint pose sliders limited to the real servo ranges — so anyone with a
 browser can judge the robot's size and articulation without MuJoCo or CAD tools.
 
-Two sources, by fidelity:
-
-    scripts/duck-viewer.py path/to/robot_walk.xml [out.html]
-
-embeds the app repository's MJCF visual model at full CAD resolution (~430k
-triangles; needs numpy, like bake-duck-mesh.py). Without an MJCF,
+Three tiers, by what is available at build time:
 
     scripts/duck-viewer.py [out.html]
 
 falls back to `robotctl/assets/duck.bin`, the terminal monitor's decimated bake
-that is committed here — coarse, but always available.
+committed here — coarse, but needs nothing else.
 
-Writes `duck-viewer.html` next to this script by default. The page embeds the
-geometry as base64 and loads only Three.js from a CDN — serve it, mail it, or
-open it from disk; there is nothing else to deploy.
+    scripts/duck-viewer.py path/to/robot_walk.xml [out.html]
+
+embeds the app repository's MJCF visual model at full CAD resolution (~430k
+triangles; needs numpy, like bake-duck-mesh.py).
+
+    scripts/duck-viewer.py path/to/robot_walk.xml [out.html] --sim
+
+additionally embeds a browser-side physics simulation: MuJoCo compiled to
+WebAssembly steps the same collision model the policies were trained on, and
+`policies/alpha_walking.onnx` + `alpha_stand.onnx` run as plain JavaScript
+(they are small MLPs), reproducing robotd's control pipeline at 50 Hz — the
+duck walks, turns, falls when pushed, and gets back up, all client-side.
+The MJCF's directory must be the app repository's robot dir (it also needs
+`robot_allcollisions.xml` and `assets/*.stl`), and --sim needs:
+
+    numpy, onnx        (pip install numpy onnx)
+    mujoco wasm dist   (npm install mujoco; or --mujoco-dist DIR with
+                        mujoco.js + mujoco.wasm from the `mujoco` npm package)
+
+The observation layout, action scaling and walk/stand switching mirror
+`duck-control` (obs.rs, policy.rs) and were validated against MuJoCo before
+this page existed; if those contracts move, this script must move with them.
+
+Writes `duck-viewer.html` next to this script by default. Everything is
+embedded (gzip+base64; the page inflates it with DecompressionStream) and only
+Three.js loads from a CDN — serve it, mail it, or open it from disk.
 """
 
 import base64
+import gzip
 import json
 import struct
 import sys
@@ -51,6 +71,21 @@ INNER = {
     "banana_pcb_locker",
     "motor_support",
 }
+
+# Meshes the full-collision model collides with. Everything else is visual and
+# is stripped from the physics MJCF.
+COLLISION_MESHES = {
+    "np_f970", "hip_l", "leg", "sole_left", "sole_right",
+    "top_head_shell", "jaw", "bottom_head_shell", "power_support",
+}
+
+# duck-control/src/model.rs DEFAULT_POSITION, minus the mouth: the home pose the
+# policies observe joints relative to, in 14-wide policy order.
+HOME_POSE = [
+    0.0, -0.0873, -0.4579, -0.0049, 0.4530,
+    0.3491, 0.3491, 0.0, 0.0,
+    0.0, 0.0873, 0.4579, 0.0049, -0.4530,
+]
 
 
 def joint_ranges(mjcf: Path) -> dict[str, list[float]]:
@@ -98,6 +133,52 @@ def weld(tris):
     if len(verts) > 0xFFFF:
         raise SystemExit(f"mesh has {len(verts)} welded vertices; grow the index width")
     return verts, faces
+
+
+def decimate(tris, budget: int):
+    """Vertex-cluster down to at most `budget` triangles (bake-duck-mesh.py's
+    method). For collision shells only — contact cares about the envelope, not
+    the finish, and every embedded byte is paid for twice in base64."""
+    import numpy as np
+    lo = tris.min(axis=(0, 1))
+    cell = max(float(np.linalg.norm(tris.max(axis=(0, 1)) - lo)) / 64.0, 1e-5)
+    while True:
+        flat = tris.reshape(-1, 3)
+        keys = np.floor((flat - lo) / cell).astype(np.int64)
+        uniq, inverse = np.unique(keys, axis=0, return_inverse=True)
+        faces = inverse.reshape(-1, 3)
+        keep = (
+            (faces[:, 0] != faces[:, 1])
+            & (faces[:, 1] != faces[:, 2])
+            & (faces[:, 0] != faces[:, 2])
+        )
+        faces = faces[keep]
+        if len(faces):
+            faces = np.unique(np.sort(faces, axis=1), axis=0)
+        if len(faces) <= budget:
+            break
+        cell *= 1.3
+    verts = np.zeros((len(uniq), 3))
+    counts = np.bincount(inverse, minlength=len(uniq)).astype(float)
+    for axis in range(3):
+        verts[:, axis] = np.bincount(
+            inverse, weights=flat[:, axis].astype(float), minlength=len(uniq)
+        )
+    verts /= counts[:, None]
+    return verts[faces].astype(np.float32)
+
+
+def write_stl_bytes(tris) -> bytes:
+    import numpy as np
+    out = bytearray(b"\0" * 80 + struct.pack("<I", len(tris)))
+    for t in tris:
+        n = np.cross(t[1] - t[0], t[2] - t[0])
+        l = np.linalg.norm(n)
+        out += struct.pack("<3f", *(n / l if l > 0 else n))
+        for v in t:
+            out += struct.pack("<3f", *v)
+        out += b"\0\0"
+    return bytes(out)
 
 
 def model_from_mjcf(mjcf_path: Path) -> dict:
@@ -222,8 +303,125 @@ def serialize(model: dict) -> bytes:
     return bytes(out)
 
 
+# ---- the physics bundle (--sim) ---------------------------------------------
+
+def physics_xml(robot_dir: Path) -> tuple[str, dict[str, bytes]]:
+    """The full-collision MJCF, stripped to what physics needs, plus its meshes.
+
+    Visual geoms carry no dynamics (mass and inertia are explicit <inertial>
+    tags), so they are dropped wholesale; the collision meshes are decimated —
+    MuJoCo collides against their hulls and the page pays for every byte twice
+    in base64. timestep 0.005 × decimation 4 is the training cadence (50 Hz).
+    """
+    tree = ET.parse(robot_dir / "robot_allcollisions.xml")
+    root = tree.getroot()
+
+    def prune(el):
+        for child in list(el):
+            if child.tag == "geom" and child.get("class") == "visual":
+                el.remove(child)
+            else:
+                prune(child)
+    prune(root)
+
+    asset = root.find("asset")
+    meshes: dict[str, bytes] = {}
+    for m in list(asset):
+        name = None
+        if m.tag == "mesh":
+            name = m.get("name") or Path(m.get("file")).stem
+        if name in COLLISION_MESHES:
+            budget = 400 if "sole" in name else 200
+            tris = decimate(load_stl(robot_dir / "assets" / f"{name}.stl"), budget)
+            meshes[f"coll_{name}.stl"] = write_stl_bytes(tris)
+            m.set("name", name)
+            m.set("file", f"coll_{name}.stl")
+        else:
+            asset.remove(m)
+    for g in root.iter("geom"):
+        g.attrib.pop("material", None)
+
+    compiler = root.find("compiler")
+    compiler.set("meshdir", ".")
+    # Single-threaded compile: the wasm build spawns a ThreadPool for 2+ meshes,
+    # and browser pages without cross-origin isolation have no SharedArrayBuffer
+    # to back it — the compile dies in the thread constructor.
+    compiler.set("usethread", "false")
+    ET.SubElement(root, "option").set("timestep", "0.005")
+    wb = root.find("worldbody")
+    wb.insert(0, ET.Element("geom", dict(name="floor", type="plane", size="0 0 0.05")))
+
+    # The 14 hinges must sit in policy order behind the freejoint: qpos[7+i],
+    # qvel[6+i] and ctrl[i] are indexed positionally in the page's control loop.
+    hinges = [j.get("name") for j in root.iter("joint") if j.get("name")]
+    expected = [n for n in JOINT_NAMES if n != "mouth"]
+    if hinges != expected:
+        raise SystemExit(f"physics joint order {hinges} != policy order {expected}")
+
+    return ET.tostring(root, encoding="unicode"), meshes
+
+
+def policy_blob(path: Path) -> tuple[bytes, list[dict]]:
+    """ONNX MLP → flat f32 blob + layout. The alpha policies are all
+    normalizer → 3×(Gemm+Elu) → Gemm; anything else must fail here, loudly,
+    rather than run garbage in the page."""
+    import onnx
+    mdl = onnx.load(str(path))
+    ops = sorted({n.op_type for n in mdl.graph.node})
+    if ops != ["Div", "Elu", "Gemm", "Sub"]:
+        raise SystemExit(f"{path}: unexpected ops {ops}; the page's inference "
+                         "implements only the alpha MLP shape")
+    weights = {i.name: onnx.numpy_helper.to_array(i) for i in mdl.graph.initializer}
+    order = ["obs_normalizer._mean", "onnx::Div_24",
+             "mlp.0.weight", "mlp.0.bias", "mlp.2.weight", "mlp.2.bias",
+             "mlp.4.weight", "mlp.4.bias", "mlp.6.weight", "mlp.6.bias"]
+    blob = bytearray()
+    meta = []
+    for name in order:
+        a = weights[name].astype("<f4")
+        meta.append({"name": name, "shape": list(a.shape), "offset": len(blob) // 4})
+        blob += a.tobytes()
+    return bytes(blob), meta
+
+
+def gz_b64(data: bytes) -> str:
+    return base64.b64encode(gzip.compress(data, 9)).decode()
+
+
+def build_sim_assets(robot_dir: Path, mujoco_dist: Path) -> str:
+    """The __SIM_ASSETS__ substitution: everything the in-page sim needs."""
+    xml, meshes = physics_xml(robot_dir)
+
+    walk_blob, walk_meta = policy_blob(REPO / "policies" / "alpha_walking.onnx")
+    stand_blob, stand_meta = policy_blob(REPO / "policies" / "alpha_stand.onnx")
+
+    glue = (mujoco_dist / "mujoco.js").read_text()
+    marker = "export default loadMujoco;"
+    if marker not in glue:
+        raise SystemExit(f"{mujoco_dist}/mujoco.js: no '{marker}' to patch — "
+                         "is this the `mujoco` npm package?")
+    glue = glue.replace(marker, "globalThis.loadMujoco = loadMujoco;")
+
+    assets = {
+        "wasm": gz_b64((mujoco_dist / "mujoco.wasm").read_bytes()),
+        "xml": base64.b64encode(xml.encode()).decode(),
+        "meshes": {k: base64.b64encode(v).decode() for k, v in meshes.items()},
+        "walk": {"blob": gz_b64(walk_blob), "meta": walk_meta},
+        "stand": {"blob": gz_b64(stand_blob), "meta": stand_meta},
+    }
+    return json.dumps(assets), glue
+
+
 def main() -> None:
-    args = sys.argv[1:]
+    args = [a for a in sys.argv[1:]]
+    sim = "--sim" in args
+    if sim:
+        args.remove("--sim")
+    mujoco_dist = Path(__file__).parent / "node_modules" / "mujoco"
+    if "--mujoco-dist" in args:
+        i = args.index("--mujoco-dist")
+        mujoco_dist = Path(args[i + 1])
+        del args[i:i + 2]
     mjcf = Path(args.pop(0)).expanduser() if args and args[0].endswith(".xml") else None
     out_path = Path(args[0]) if args else Path(__file__).parent / "duck-viewer.html"
 
@@ -238,24 +436,37 @@ def main() -> None:
         source_note = f"フルCADメッシュ（{tris / 1000:.0f}k三角形） — {mjcf.name}"
         dims_note = "寸法は現在のポーズの外接寸法（CAD原寸）。床グリッドは5cm。"
     else:
+        if sim:
+            raise SystemExit("--sim needs the MJCF path (the physics model and "
+                             "collision STLs live next to it)")
         model = model_from_duck_bin((REPO / "robotctl" / "assets" / "duck.bin").read_bytes())
         ranges = joint_ranges(REPO / "kinematics" / "assets" / "alpha" / "robot_walk.xml")
         source_note = "robotctl/assets/duck.bin — 端末モニタ用の間引きメッシュ"
         dims_note = "寸法は現在のポーズの外接寸法（メッシュはデシメート済みのため±数mm）。床グリッドは5cm。"
 
+    if sim:
+        sim_assets, glue = build_sim_assets(mjcf.parent, mujoco_dist)
+    else:
+        sim_assets, glue = "null", ""
+
     html = TEMPLATE
-    html = html.replace("__DUCK_B64__", base64.b64encode(serialize(model)).decode())
+    html = html.replace("__DUCK_GZ_B64__", gz_b64(serialize(model)))
     html = html.replace("__JOINT_NAMES__", json.dumps(JOINT_NAMES))
     html = html.replace("__JOINT_RANGES__", json.dumps(ranges))
+    html = html.replace("__HOME_POSE__", json.dumps(HOME_POSE))
     html = html.replace("__SOURCE_NOTE__", source_note)
     html = html.replace("__DIMS_NOTE__", dims_note)
+    html = html.replace("__MUJOCO_GLUE__", glue)
+    html = html.replace("__SIM_ASSETS__", sim_assets)
     out_path.write_text(html)
-    print(f"{out_path}: {out_path.stat().st_size / 1024 / 1024:.1f} MB")
+    print(f"{out_path}: {out_path.stat().st_size / 1024 / 1024:.1f} MB"
+          + (" (with physics sim)" if sim else ""))
 
 
 # The page itself. Kept as one template string so the tool stays a single file;
-# tokens (__DUCK_B64__ etc.) are substituted above.
-TEMPLATE = r"""<title>Microduck Assy Viewer</title>
+# tokens (__DUCK_GZ_B64__ etc.) are substituted above.
+TEMPLATE = r"""<meta charset="utf-8">
+<title>Microduck Assy Viewer</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600&family=IBM+Plex+Sans+JP:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
@@ -349,7 +560,12 @@ TEMPLATE = r"""<title>Microduck Assy Viewer</title>
   #chips {
     bottom: 16px; left: 16px; right: auto;
     display: flex; flex-wrap: wrap; gap: 8px;
-    padding: 10px; max-width: calc(100vw - 32px);
+    padding: 10px; z-index: 5;
+    /* stay clear of the right-hand panel so chips are always clickable */
+    max-width: calc(100vw - 326px);
+  }
+  @media (max-width: 760px) {
+    #chips { max-width: calc(100vw - 32px); }
   }
   .chip {
     font: inherit; font-size: 12.5px; color: var(--muted);
@@ -360,37 +576,63 @@ TEMPLATE = r"""<title>Microduck Assy Viewer</title>
     color: var(--ink); border-color: var(--accent);
     box-shadow: inset 0 0 0 1px var(--accent);
   }
-  .chip:focus-visible, #joints input:focus-visible, .chip-reset:focus-visible {
+  .chip:disabled { opacity: 0.5; cursor: wait; }
+  .chip:focus-visible, input:focus-visible, .chip-reset:focus-visible, .simbtn:focus-visible {
     outline: 2px solid var(--accent); outline-offset: 2px;
   }
 
-  #joints {
-    top: 16px; right: 16px; width: 252px;
+  #joints, #simpanel {
+    top: 16px; right: 16px; width: 262px;
     max-height: calc(100vh - 32px);
     display: flex; flex-direction: column;
   }
-  #joints .bar {
+  .bar {
     display: flex; align-items: center; justify-content: space-between;
     padding: 10px 14px;
   }
-  #joints .bar h2 { font-size: 12px; font-weight: 500; letter-spacing: 0.08em; color: var(--muted); }
+  .bar h2 { font-size: 12px; font-weight: 500; letter-spacing: 0.08em; color: var(--muted); }
   .chip-reset {
     font: inherit; font-size: 11.5px; color: var(--muted);
     background: transparent; border: 1px solid var(--surface-border);
     border-radius: 6px; padding: 3px 9px; cursor: pointer;
   }
-  #joints .body { overflow-y: auto; padding: 0 14px 12px; }
-  #joints h3 {
+  #joints .body, #simpanel .body { overflow-y: auto; padding: 0 14px 12px; }
+  #joints h3, #simpanel h3 {
     font-size: 10.5px; font-weight: 500; letter-spacing: 0.09em;
     text-transform: uppercase; color: var(--muted);
     margin: 12px 0 4px;
   }
-  #joints .row { display: grid; grid-template-columns: 1fr 44px; align-items: center; gap: 8px; padding: 3px 0; }
-  #joints label { font-size: 12px; display: block; }
-  #joints input[type="range"] { width: 100%; accent-color: var(--accent); height: 18px; }
-  #joints .deg {
+  .row { display: grid; grid-template-columns: 1fr 44px; align-items: center; gap: 8px; padding: 3px 0; }
+  .row label { font-size: 12px; display: block; }
+  input[type="range"] { width: 100%; accent-color: var(--accent); height: 18px; }
+  .deg {
     font-family: "IBM Plex Mono", monospace; font-size: 11px;
     font-variant-numeric: tabular-nums; text-align: right; color: var(--muted);
+  }
+
+  #simpanel { display: none; }
+  #simstatus {
+    display: grid; grid-template-columns: auto 1fr; gap: 4px 12px;
+    font-size: 12px; padding: 2px 0 6px;
+  }
+  #simstatus .k { color: var(--muted); }
+  #simstatus .v { font-family: "IBM Plex Mono", monospace; font-variant-numeric: tabular-nums; text-align: right; }
+  #simstate { font-weight: 500; }
+  .padgrid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 6px 0;
+  }
+  .simbtn {
+    font: inherit; font-size: 12.5px; color: var(--ink);
+    background: transparent; border: 1px solid var(--surface-border);
+    border-radius: 8px; padding: 9px 4px; cursor: pointer;
+    user-select: none; -webkit-user-select: none; touch-action: none;
+  }
+  .simbtn:active, .simbtn.held { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .simbtn.wide { grid-column: span 3; }
+  #simpanel .hintline { color: var(--muted); font-size: 11px; margin: 8px 0 2px; }
+  #fallnote {
+    display: none; color: var(--accent-ink); font-size: 12px; font-weight: 500;
+    margin-top: 6px;
   }
 
   #hint {
@@ -431,6 +673,7 @@ TEMPLATE = r"""<title>Microduck Assy Viewer</title>
   <button class="chip" data-ref="phone" aria-pressed="false">スマートフォン</button>
   <button class="chip" data-ref="ruler" aria-pressed="true">スケール（cm）</button>
   <button class="chip" id="xray" aria-pressed="false">透視</button>
+  <button class="chip" id="simtoggle" aria-pressed="false" hidden>歩行シミュレーション</button>
 </div>
 
 <div class="panel" id="joints">
@@ -441,22 +684,62 @@ TEMPLATE = r"""<title>Microduck Assy Viewer</title>
   <div class="body" id="joint-rows"></div>
 </div>
 
+<div class="panel" id="simpanel">
+  <div class="bar">
+    <h2>歩行シミュレーション</h2>
+    <button class="chip-reset" id="simreset">リセット</button>
+  </div>
+  <div class="body">
+    <div id="simstatus">
+      <span class="k">状態</span><span class="v" id="simstate">—</span>
+      <span class="k">前進速度</span><span class="v" id="simvx">0.00 m/s</span>
+      <span class="k">旋回速度</span><span class="v" id="simwz">0.00 rad/s</span>
+      <span class="k">移動距離</span><span class="v" id="simdist">0.00 m</span>
+    </div>
+    <div class="padgrid">
+      <button class="simbtn" data-cmd="turnl">⟲ 左旋回</button>
+      <button class="simbtn" data-cmd="fwd">▲ 前進</button>
+      <button class="simbtn" data-cmd="turnr">⟳ 右旋回</button>
+      <button class="simbtn" data-cmd="left">◀ 左移動</button>
+      <button class="simbtn" data-cmd="stop">■ 停止</button>
+      <button class="simbtn" data-cmd="right">▶ 右移動</button>
+      <button class="simbtn wide" data-cmd="push">押す（いたずら）</button>
+    </div>
+    <div id="fallnote">転倒！ 指令を止めて自動復帰中…</div>
+    <h3>頭コマンド</h3>
+    <div id="head-rows"></div>
+    <div class="hintline">キー操作: W/↑ 前進 ・ A/D 横移動 ・ ←/→ 旋回 ・ Space 停止</div>
+    <div class="hintline">ボタンとキーは押している間だけ効きます。倒れたら手を離すと自力で起き上がります。実機と同じ学習済みポリシー（alpha_walking / alpha_stand）がMuJoCo (WebAssembly) 上で50Hz動作しています。</div>
+  </div>
+</div>
+
 <div id="hint">ドラッグ：回転 ／ ホイール・ピンチ：ズーム ／ Shift+ドラッグ：移動</div>
 <div id="fallback">3D表示を初期化できませんでした。WebGL対応のブラウザでご覧ください。</div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-<script>
+<script type="module">__MUJOCO_GLUE__</script>
+<script type="module">
 "use strict";
 
-// ---- embedded model ---------------------------------------------------------
-// "DUK2", written by scripts/duck-viewer.py — see serialize() there.
+// ---- embedded data ----------------------------------------------------------
 const JOINT_NAMES = __JOINT_NAMES__;
 const JOINT_RANGES = __JOINT_RANGES__;
-const DUCK_B64 = "__DUCK_B64__";
+const HOME = __HOME_POSE__;          // 14-wide policy order (no mouth)
+const SIM_ASSETS = __SIM_ASSETS__;   // null when built without --sim
+const DUCK_GZ = "__DUCK_GZ_B64__";
 
-function parseDuck(b64) {
-  const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-  const dv = new DataView(bytes.buffer);
+function b64bytes(b64) {
+  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+}
+async function gunzip(b64) {
+  const ds = new DecompressionStream("gzip");
+  const resp = new Response(new Blob([b64bytes(b64)]).stream().pipeThrough(ds));
+  return new Uint8Array(await resp.arrayBuffer());
+}
+
+// "DUK2", written by scripts/duck-viewer.py — see serialize() there.
+function parseDuck(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let at = 0;
   const u16 = () => { const v = dv.getUint16(at, true); at += 2; return v; };
   const i16 = () => { const v = dv.getInt16(at, true); at += 2; return v; };
@@ -470,12 +753,13 @@ function parseDuck(b64) {
   if (u32() !== 2) throw new Error("bad version");
   const nMesh = u16(), nBody = u16(), nPart = u16();
 
+  const base = bytes.byteOffset;
   const meshes = [];
   for (let m = 0; m < nMesh; m++) {
     const nv = u32(), nf = u32();
     // Copy out (slice) rather than view: offsets are not element-aligned.
-    const verts = new Float32Array(bytes.buffer.slice(at, at + nv * 12)); at += nv * 12;
-    const faces = new Uint16Array(bytes.buffer.slice(at, at + nf * 6)); at += nf * 6;
+    const verts = new Float32Array(bytes.buffer.slice(base + at, base + at + nv * 12)); at += nv * 12;
+    const faces = new Uint16Array(bytes.buffer.slice(base + at, base + at + nf * 6)); at += nf * 6;
     meshes.push({ verts, faces });
   }
   const bodies = [];
@@ -505,7 +789,7 @@ try {
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(32, 1, 0.01, 20);
+const camera = new THREE.PerspectiveCamera(32, 1, 0.01, 40);
 
 scene.add(new THREE.HemisphereLight(0xffffff, 0x8899aa, 0.85));
 const sun = new THREE.DirectionalLight(0xffffff, 0.75);
@@ -520,23 +804,31 @@ const themed = []; // objects recoloured/redrawn when the theme flips
 function cssColor(name) {
   return new THREE.Color(getComputedStyle(document.documentElement).getPropertyValue(name).trim());
 }
-const gridMajor = new THREE.GridHelper(0.6, 12); // 5 cm
-const gridMinor = new THREE.GridHelper(0.6, 60); // 1 cm
-gridMinor.material.transparent = true;
-gridMinor.material.opacity = 0.45;
-scene.add(gridMajor, gridMinor);
+let gridMajor = null, gridMinor = null;
+function buildGrids(span) {
+  if (gridMajor) { scene.remove(gridMajor, gridMinor); }
+  gridMajor = new THREE.GridHelper(span, Math.round(span / 0.05)); // 5 cm
+  gridMinor = new THREE.GridHelper(span, Math.round(span / 0.01)); // 1 cm
+  gridMinor.material.transparent = true;
+  gridMinor.material.opacity = 0.45;
+  scene.add(gridMajor, gridMinor);
+  applyTheme();
+}
 
 function applyTheme() {
   renderer.setClearColor(cssColor("--bg"));
-  gridMajor.material.color = cssColor("--grid-major");
-  gridMinor.material.color = cssColor("--grid-minor");
+  if (gridMajor) {
+    gridMajor.material.color = cssColor("--grid-major");
+    gridMinor.material.color = cssColor("--grid-minor");
+  }
   for (const fn of themed) fn();
 }
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
 new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+buildGrids(0.6);
 
 // ---- robot ------------------------------------------------------------------
-const duck = parseDuck(DUCK_B64);
+const duck = parseDuck(await gunzip(DUCK_GZ));
 
 const robotRoot = new THREE.Group();
 robotRoot.rotation.x = -Math.PI / 2; // MJCF z-up → Three y-up
@@ -602,7 +894,7 @@ function pose() {
       q.multiply(tmpQ.setFromAxisAngle(tmpAxis, angles[b.joint]));
     }
   });
-  updateDims();
+  if (!simActive) updateDims();
 }
 
 // ---- dimensions -------------------------------------------------------------
@@ -693,8 +985,13 @@ for (const chip of document.querySelectorAll(".chip[data-ref]")) {
   chip.addEventListener("click", () => {
     const on = chip.getAttribute("aria-pressed") !== "true";
     chip.setAttribute("aria-pressed", String(on));
-    refs[chip.dataset.ref].visible = on;
+    refs[chip.dataset.ref].visible = on && !simActive;
   });
+}
+function refsVisible(show) {
+  for (const chip of document.querySelectorAll(".chip[data-ref]")) {
+    refs[chip.dataset.ref].visible = show && chip.getAttribute("aria-pressed") === "true";
+  }
 }
 
 // ---- joint sliders ----------------------------------------------------------
@@ -778,7 +1075,7 @@ canvas.addEventListener("pointerup", () => { drag = null; });
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 canvas.addEventListener("wheel", (e) => {
   e.preventDefault();
-  dist = Math.min(3, Math.max(0.15, dist * Math.exp(e.deltaY * 0.001)));
+  dist = Math.min(6, Math.max(0.15, dist * Math.exp(e.deltaY * 0.001)));
   placeCamera();
 }, { passive: false });
 
@@ -793,12 +1090,297 @@ canvas.addEventListener("pointermove", (e) => {
     const now = [...touches.values()];
     const d0 = Math.hypot(prev[0].clientX - prev[1].clientX, prev[0].clientY - prev[1].clientY);
     const d1 = Math.hypot(now[0].clientX - now[1].clientX, now[0].clientY - now[1].clientY);
-    if (d0 > 0) { dist = Math.min(3, Math.max(0.15, dist * d0 / d1)); placeCamera(); }
+    if (d0 > 0) { dist = Math.min(6, Math.max(0.15, dist * d0 / d1)); placeCamera(); }
     drag = null; // two fingers zoom; don't also rotate
   }
 });
 canvas.addEventListener("pointerup", (e) => touches.delete(e.pointerId));
 canvas.addEventListener("pointercancel", (e) => touches.delete(e.pointerId));
+
+// ---- physics simulation (--sim builds only) ---------------------------------
+// MuJoCo (wasm) steps the training collision model at 200 Hz; the real robot's
+// walking and standing policies run as plain-JS MLPs at 50 Hz, with robotd's
+// observation layout and walk/stand switching. See duck-control/src/obs.rs.
+let simActive = false;
+let sim = null;
+
+function mlp(meta, blob) {
+  const W = {};
+  for (const m of meta) {
+    const n = m.shape.reduce((a, b) => a * b, 1);
+    W[m.name] = { a: blob.subarray(m.offset, m.offset + n), shape: m.shape };
+  }
+  const linear = (w, b, x) => {
+    const [out, inn] = w.shape;
+    const y = new Float32Array(out);
+    for (let o = 0; o < out; o++) {
+      let s = b.a[o];
+      const row = o * inn;
+      for (let i = 0; i < inn; i++) s += w.a[row + i] * x[i];
+      y[o] = s;
+    }
+    return y;
+  };
+  const elu = (x) => { for (let i = 0; i < x.length; i++) if (x[i] < 0) x[i] = Math.exp(x[i]) - 1; return x; };
+  return (obs) => {
+    const x = new Float32Array(61);
+    const mean = W["obs_normalizer._mean"].a, std = W["onnx::Div_24"].a;
+    for (let i = 0; i < 61; i++) x[i] = (obs[i] - mean[i]) / std[i];
+    let h = elu(linear(W["mlp.0.weight"], W["mlp.0.bias"], x));
+    h = elu(linear(W["mlp.2.weight"], W["mlp.2.bias"], h));
+    h = elu(linear(W["mlp.4.weight"], W["mlp.4.bias"], h));
+    return linear(W["mlp.6.weight"], W["mlp.6.bias"], h);
+  };
+}
+
+async function initSim() {
+  const [wasm, walkBlob, standBlob] = await Promise.all([
+    gunzip(SIM_ASSETS.wasm), gunzip(SIM_ASSETS.walk.blob), gunzip(SIM_ASSETS.stand.blob),
+  ]);
+  const mujoco = await loadMujoco({ wasmBinary: wasm });
+  mujoco.FS.writeFile("/physics.xml", b64bytes(SIM_ASSETS.xml));
+  for (const [name, b64] of Object.entries(SIM_ASSETS.meshes)) {
+    mujoco.FS.writeFile("/" + name, b64bytes(b64));
+  }
+  const model = mujoco.MjModel.mj_loadXML("/physics.xml");
+  const data = new mujoco.MjData(model);
+
+  const nets = {
+    walk: mlp(SIM_ASSETS.walk.meta, new Float32Array(walkBlob.buffer)),
+    stand: mlp(SIM_ASSETS.stand.meta, new Float32Array(standBlob.buffer)),
+  };
+
+  let lastAction = new Float32Array(14);
+  const obs = new Float32Array(61);
+
+  function reset() {
+    mujoco.mj_resetData(model, data);
+    const qpos = data.qpos;
+    qpos[2] = 0.125;
+    qpos[3] = 1; qpos[4] = 0; qpos[5] = 0; qpos[6] = 0;
+    for (let j = 0; j < 14; j++) { qpos[7 + j] = HOME[j]; data.ctrl[j] = HOME[j]; }
+    lastAction = new Float32Array(14);
+    mujoco.mj_forward(model, data);
+  }
+  reset();
+
+  // One 50 Hz control tick: observation → policy → targets → 4 physics steps.
+  function tick(cmd) {
+    const qpos = data.qpos, qvel = data.qvel;
+    const w = qpos[3], x = qpos[4], y = qpos[5], z = qpos[6];
+    obs[0] = qvel[3]; obs[1] = qvel[4]; obs[2] = qvel[5]; // gyro, trunk frame
+    // projected gravity: R^T (0,0,-1)
+    obs[3] = -2 * (x * z - w * y);
+    obs[4] = -2 * (y * z + w * x);
+    obs[5] = -(1 - 2 * (x * x + y * y));
+    for (let j = 0; j < 14; j++) {
+      obs[6 + j] = qpos[7 + j] - HOME[j];
+      obs[20 + j] = qvel[6 + j];
+      obs[34 + j] = lastAction[j];
+    }
+    obs[48] = cmd.vx; obs[49] = cmd.vy; obs[50] = cmd.vyaw;
+    obs[51] = cmd.head[0]; obs[52] = cmd.head[1]; obs[53] = cmd.head[2]; obs[54] = cmd.head[3];
+    obs[55] = 0; obs[56] = 0; obs[57] = cmd.bodyZ; obs[58] = 0; obs[59] = 0; obs[60] = 0;
+
+    // robotd's rule: below the standing threshold the standing net drives —
+    // it is also the fall-recovery net, so zero command = get back up.
+    const mag = Math.hypot(cmd.vx, cmd.vy, cmd.vyaw);
+    const action = (mag <= 0.05 ? nets.stand : nets.walk)(obs);
+    lastAction = action;
+    for (let j = 0; j < 14; j++) data.ctrl[j] = HOME[j] + action[j];
+    for (let k = 0; k < 4; k++) mujoco.mj_step(model, data);
+  }
+
+  function push() {
+    const dir = Math.random() * Math.PI * 2;
+    const mag = 1.0 + Math.random() * 0.4; // the training push magnitude
+    data.qvel[0] += mag * Math.cos(dir);
+    data.qvel[1] += mag * Math.sin(dir);
+  }
+
+  return {
+    tick, reset, push,
+    get qpos() { return data.qpos; },
+    get qvel() { return data.qvel; },
+    up() { const q = data.qpos; return 1 - 2 * (q[4] * q[4] + q[5] * q[5]); },
+  };
+}
+
+// ---- sim UI -----------------------------------------------------------------
+const simToggle = document.getElementById("simtoggle");
+if (SIM_ASSETS && typeof DecompressionStream !== "undefined") simToggle.hidden = false;
+
+const held = new Set();
+const cmd = { vx: 0, vy: 0, vyaw: 0, head: [0, 0, 0, 0], bodyZ: 0 };
+const cmdTarget = { vx: 0, vy: 0, vyaw: 0 };
+let fallen = false;
+let simDistance = 0;
+let lastSimPos = null;
+
+function computeTarget() {
+  // Fallen: force zero twist so the standing net can do its recovery job.
+  if (fallen) { cmdTarget.vx = 0; cmdTarget.vy = 0; cmdTarget.vyaw = 0; return; }
+  cmdTarget.vx = held.has("fwd") ? 0.3 : held.has("back") ? -0.25 : 0;
+  cmdTarget.vy = held.has("left") ? 0.2 : held.has("right") ? -0.2 : 0;
+  cmdTarget.vyaw = held.has("turnl") ? 0.7 : held.has("turnr") ? -0.7 : 0;
+}
+const KEYMAP = {
+  w: "fwd", arrowup: "fwd", s: "back", arrowdown: "back",
+  a: "left", d: "right", arrowleft: "turnl", arrowright: "turnr",
+};
+addEventListener("keydown", (e) => {
+  if (!simActive || e.repeat || e.target.tagName === "INPUT") return;
+  const c = KEYMAP[e.key.toLowerCase()];
+  if (c) { held.add(c); computeTarget(); e.preventDefault(); }
+  if (e.key === " ") { held.clear(); computeTarget(); e.preventDefault(); }
+});
+addEventListener("keyup", (e) => {
+  const c = KEYMAP[e.key.toLowerCase()];
+  if (c) { held.delete(c); computeTarget(); }
+});
+for (const btn of document.querySelectorAll(".simbtn[data-cmd]")) {
+  const c = btn.dataset.cmd;
+  if (c === "stop") { btn.addEventListener("click", () => { held.clear(); computeTarget(); }); continue; }
+  if (c === "push") { btn.addEventListener("click", () => { if (sim) sim.push(); }); continue; }
+  btn.addEventListener("pointerdown", (e) => { btn.setPointerCapture(e.pointerId); btn.classList.add("held"); held.add(c); computeTarget(); });
+  const release = () => { btn.classList.remove("held"); held.delete(c); computeTarget(); };
+  btn.addEventListener("pointerup", release);
+  btn.addEventListener("pointercancel", release);
+}
+document.getElementById("simreset").addEventListener("click", () => {
+  if (!sim) return;
+  sim.reset();
+  simDistance = 0; lastSimPos = null;
+  held.clear(); computeTarget();
+});
+
+// Head command sliders: ride the command block (obs.rs 51..55), so they work
+// while standing and walking alike — the policy moves the head, not us.
+{
+  const rows = document.getElementById("head-rows");
+  const HEADS = [["首ピッチ", 0, -0.5, 0.5], ["頭ピッチ", 1, -0.5, 0.5],
+                 ["頭ヨー", 2, -1.0, 1.0], ["頭ロール", 3, -0.4, 0.4]];
+  for (const [label, i, lo, hi] of HEADS) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const l = document.createElement("label");
+    l.textContent = label;
+    const input = document.createElement("input");
+    input.type = "range"; input.min = lo; input.max = hi; input.step = 0.01; input.value = 0;
+    input.setAttribute("aria-label", `head command ${label}`);
+    const deg = document.createElement("span");
+    deg.className = "deg"; deg.textContent = "0°";
+    input.addEventListener("input", () => {
+      cmd.head[i] = parseFloat(input.value);
+      deg.textContent = `${Math.round(cmd.head[i] * 180 / Math.PI)}°`;
+    });
+    l.appendChild(input);
+    row.append(l, deg);
+    rows.appendChild(row);
+  }
+}
+
+let simInitPromise = null;
+simToggle.addEventListener("click", async () => {
+  const on = simToggle.getAttribute("aria-pressed") !== "true";
+  if (on && !sim) {
+    simToggle.disabled = true;
+    simToggle.textContent = "読み込み中…";
+    try {
+      simInitPromise ??= initSim();
+      sim = await simInitPromise;
+    } catch (e) {
+      simToggle.textContent = "シム初期化失敗";
+      console.error(e);
+      return;
+    }
+    simToggle.disabled = false;
+    simToggle.textContent = "歩行シミュレーション";
+  }
+  simActive = on && !!sim;
+  simToggle.setAttribute("aria-pressed", String(simActive));
+  document.getElementById("joints").style.display = simActive ? "none" : "";
+  document.getElementById("simpanel").style.display = simActive ? "flex" : "";
+  document.getElementById("hint").style.display = simActive ? "none" : "";
+  refs.ruler.visible = !simActive && document.querySelector('[data-ref="ruler"]').getAttribute("aria-pressed") === "true";
+  refsVisible(!simActive);
+  buildGrids(simActive ? 4.0 : 0.6);
+  held.clear(); computeTarget();
+  if (simActive) {
+    sim.reset();
+    simDistance = 0; lastSimPos = null;
+    simAccum = 0; simPrev = null;
+  } else {
+    // Back to the assy view: home pose at the origin.
+    for (const s of sliders) { angles[s.idx] = parseFloat(s.input.value); }
+    bodyGroups[0].position.set(...duck.bodies[0].pos);
+    pose();
+    target.set(0, 0.125, 0);
+    placeCamera();
+    updateDims();
+  }
+});
+
+// ---- sim loop ---------------------------------------------------------------
+const CONTROL_DT = 0.02;
+let simAccum = 0;
+let simPrev = null;
+const stateEl = document.getElementById("simstate");
+const vxEl = document.getElementById("simvx");
+const wzEl = document.getElementById("simwz");
+const distEl = document.getElementById("simdist");
+const fallnote = document.getElementById("fallnote");
+
+function simFrame(now) {
+  if (simPrev === null) simPrev = now;
+  simAccum += Math.min((now - simPrev) / 1000, 0.1);
+  simPrev = now;
+
+  // Ramp the actual command toward the held target: sticks, not steps.
+  const approach = (v, t, rate) => v + Math.sign(t - v) * Math.min(Math.abs(t - v), rate * CONTROL_DT);
+  let ticks = 0;
+  while (simAccum >= CONTROL_DT && ticks < 8) {
+    cmd.vx = approach(cmd.vx, cmdTarget.vx, 0.5);
+    cmd.vy = approach(cmd.vy, cmdTarget.vy, 0.4);
+    cmd.vyaw = approach(cmd.vyaw, cmdTarget.vyaw, 1.6);
+    sim.tick(cmd);
+    simAccum -= CONTROL_DT;
+    ticks++;
+  }
+
+  const qpos = sim.qpos, qvel = sim.qvel;
+  const up = sim.up();
+  const wasFallen = fallen;
+  fallen = up < 0.55 || qpos[2] < 0.055;
+  if (fallen !== wasFallen) { fallnote.style.display = fallen ? "block" : "none"; computeTarget(); }
+
+  // Drive the visual model: joint angles + trunk pose from the physics state.
+  for (let slot = 0; slot < 14; slot++) {
+    const joint = slot < 9 ? slot : slot + 1; // skip the mouth slot
+    angles[joint] = qpos[7 + slot];
+  }
+  pose();
+  const trunk = bodyGroups[0];
+  trunk.position.set(qpos[0], qpos[1], qpos[2]);
+  trunk.quaternion.set(qpos[4], qpos[5], qpos[6], qpos[3]);
+
+  // Camera follows the duck (MJCF z-up → world: x→x, z→y, y→-z).
+  target.x += (qpos[0] - target.x) * 0.08;
+  target.y += (qpos[2] - target.y) * 0.08;
+  target.z += (-qpos[1] - target.z) * 0.08;
+  placeCamera();
+
+  // Status readout: body-frame forward speed and yaw rate, plus odometer.
+  const w = qpos[3], x = qpos[4], y = qpos[5], z = qpos[6];
+  const fwd = (1 - 2 * (y * y + z * z)) * qvel[0] + 2 * (x * y + w * z) * qvel[1] + 2 * (x * z - w * y) * qvel[2];
+  if (lastSimPos) simDistance += Math.hypot(qpos[0] - lastSimPos[0], qpos[1] - lastSimPos[1]);
+  lastSimPos = [qpos[0], qpos[1]];
+  stateEl.textContent = fallen ? "転倒 → 復帰中"
+    : Math.hypot(cmd.vx, cmd.vy, cmd.vyaw) <= 0.05 ? "立位 (alpha_stand)" : "歩行 (alpha_walking)";
+  vxEl.textContent = `${fwd.toFixed(2)} m/s`;
+  wzEl.textContent = `${qvel[5].toFixed(2)} rad/s`;
+  distEl.textContent = `${simDistance.toFixed(2)} m`;
+}
 
 // ---- boot -------------------------------------------------------------------
 function resize() {
@@ -812,7 +1394,11 @@ resize();
 applyTheme();
 pose();
 placeCamera();
-renderer.setAnimationLoop(() => renderer.render(scene, camera));
+renderer.setAnimationLoop((now) => {
+  if (simActive && sim) simFrame(now);
+  else simPrev = null;
+  renderer.render(scene, camera);
+});
 </script>
 """
 
