@@ -458,6 +458,10 @@ def main() -> None:
     html = html.replace("__DIMS_NOTE__", dims_note)
     html = html.replace("__MUJOCO_GLUE__", glue)
     html = html.replace("__SIM_ASSETS__", sim_assets)
+    # A visible build tag (in the AR診断 line) so "which version am I looking
+    # at?" is answerable from a phone screenshot.
+    import datetime
+    html = html.replace("__BUILD_TAG__", datetime.date.today().isoformat())
     out_path.write_text(html)
     print(f"{out_path}: {out_path.stat().st_size / 1024 / 1024:.1f} MB"
           + (" (with physics sim)" if sim else ""))
@@ -635,6 +639,13 @@ TEMPLATE = r"""<meta charset="utf-8">
   .simbtn:active, .simbtn.held, .simbtn[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
   .simbtn.wide { grid-column: span 3; }
   #simpanel .hintline { color: var(--muted); font-size: 11px; margin: 8px 0 2px; }
+  #ar-escape a.simbtn { display: block; text-align: center; text-decoration: none; margin: 6px 0; }
+  .urlrow { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
+  #ar-url {
+    flex: 1; min-width: 0; font-family: "IBM Plex Mono", monospace; font-size: 10.5px;
+    color: var(--muted); background: transparent;
+    border: 1px solid var(--surface-border); border-radius: 6px; padding: 5px 7px;
+  }
   #fallnote {
     display: none; color: var(--accent-ink); font-size: 12px; font-weight: 500;
     margin-top: 6px;
@@ -725,6 +736,14 @@ TEMPLATE = r"""<meta charset="utf-8">
       <button class="simbtn wide" id="ar-xr" hidden>WebXR AR（実寸でその場に置く）</button>
       <button class="simbtn wide" id="ar-grid" aria-pressed="true">床グリッド表示</button>
     </div>
+    <div id="ar-escape" hidden>
+      <a class="simbtn wide" id="ar-link" target="_blank" rel="noopener">リンクとして単独ページを開く</a>
+      <div class="urlrow">
+        <input id="ar-url" readonly aria-label="単独ページのURL">
+        <button class="chip-reset" id="ar-copy">コピー</button>
+      </div>
+    </div>
+    <div class="hintline" id="ar-diag"></div>
     <input type="file" id="ar-file" accept="image/*" hidden>
     <input type="file" id="ar-capture" accept="image/*" capture="environment" hidden>
     <div class="hintline">撮影＝その場でカメラ撮影して重ねる（権限不要・スマホ推奨） ／ 写真＝保存済み画像 ／ ライブ＝カメラ映像（ブラウザの権限が必要）</div>
@@ -1378,19 +1397,31 @@ function applyAr(mode) {
 // prompt for the camera. The 別タブ button is that escape hatch.
 const embedded = (() => { try { return window.self !== window.top; } catch { return true; } })();
 const arOpen = document.getElementById("ar-open");
-if (embedded) arOpen.hidden = false;
+const arEscape = document.getElementById("ar-escape");
+const arUrl = document.getElementById("ar-url");
+if (embedded) {
+  arOpen.hidden = false;
+  arEscape.hidden = false;
+  document.getElementById("ar-link").href = location.href;
+  arUrl.value = location.href;
+}
+// A one-line diagnosis so "it doesn't work" conversations have something to
+// quote: where the page thinks it runs, and whether the live API even exists.
+document.getElementById("ar-diag").textContent =
+  `build __BUILD_TAG__ ／ 状態: ${embedded ? "埋め込み表示（ライブカメラ不可の場合あり）" : "単独ページ"} ／ ` +
+  `ライブAPI: ${navigator.mediaDevices && navigator.mediaDevices.getUserMedia ? "あり" : "なし"}`;
 arOpen.addEventListener("click", async () => {
   const w = window.open(location.href, "_blank");
   if (!w) {
-    // Pop-up blocked (or the sandbox forbids it): hand over the URL instead.
-    let copied = false;
-    try { await navigator.clipboard.writeText(location.href); copied = true; } catch {}
     arHint.style.display = "block";
-    arHint.textContent = (copied
-      ? "このページのURLをコピーしました。"
-      : `このURLをコピーしてください: ${location.href} `)
-      + "SafariやChromeで直接開くと、ライブカメラの許可ダイアログを出せます。";
+    arHint.textContent = "ポップアップがブロックされました。下の「リンクとして単独ページを開く」を押すか、URL欄をコピーしてSafariに貼り付けてください。";
   }
+});
+document.getElementById("ar-copy").addEventListener("click", async () => {
+  let ok = false;
+  try { await navigator.clipboard.writeText(location.href); ok = true; } catch {}
+  if (!ok) { arUrl.focus(); arUrl.select(); try { ok = document.execCommand("copy"); } catch {} }
+  document.getElementById("ar-copy").textContent = ok ? "コピー済" : "手動で選択してコピー";
 });
 
 document.getElementById("ar-cam").addEventListener("click", async () => {
