@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """Emit a standalone HTML viewer of the robot's assembly model.
 
-`robotctl/assets/duck.bin` is the robot's visual assembly — the CAD-derived meshes,
-the kinematic tree, and the per-part colours that `robotctl monitor` draws in a
-terminal. This tool wraps that same blob in a self-contained web page: a Three.js
-scene with orbit controls, a centimetre grid, real-world scale references (a drink
-can, a bottle, a phone) and per-joint pose sliders, so anyone with a browser can
-judge the robot's size and articulation without MuJoCo or the app repository.
+The page is a self-contained web view of the robot: a Three.js scene with orbit
+controls, a centimetre grid and ruler, real-world scale references (a drink can,
+a bottle, a phone), an x-ray mode that reveals the parts inside the shells, and
+per-joint pose sliders limited to the real servo ranges — so anyone with a
+browser can judge the robot's size and articulation without MuJoCo or CAD tools.
+
+Two sources, by fidelity:
+
+    scripts/duck-viewer.py path/to/robot_walk.xml [out.html]
+
+embeds the app repository's MJCF visual model at full CAD resolution (~430k
+triangles; needs numpy, like bake-duck-mesh.py). Without an MJCF,
 
     scripts/duck-viewer.py [out.html]
 
+falls back to `robotctl/assets/duck.bin`, the terminal monitor's decimated bake
+that is committed here — coarse, but always available.
+
 Writes `duck-viewer.html` next to this script by default. The page embeds the
 geometry as base64 and loads only Three.js from a CDN — serve it, mail it, or
-open it from disk; there is nothing else to deploy. Joint ranges come from the
-kinematics MJCF so the sliders stop where the real servos do.
-
-Needs only the standard library; never runs on the board.
+open it from disk; there is nothing else to deploy.
 """
 
 import base64
@@ -35,6 +41,17 @@ JOINT_NAMES = [
     "right_hip_yaw", "right_hip_roll", "right_hip_pitch", "right_knee", "right_ankle",
 ]
 
+# Parts enclosed by the shells: batteries, PCBs, brackets. Invisible normally,
+# the whole point of the viewer's x-ray mode.
+INNER = {
+    "np_f970",
+    "pcb__raspberry_pi_zero_2_w",
+    "elec_rpi_robot_hat_pcb",
+    "power_support",
+    "banana_pcb_locker",
+    "motor_support",
+}
+
 
 def joint_ranges(mjcf: Path) -> dict[str, list[float]]:
     """Joint name → [lo, hi] radians, straight from the model the policies use."""
@@ -48,23 +65,192 @@ def joint_ranges(mjcf: Path) -> dict[str, list[float]]:
     return out
 
 
-def main() -> None:
-    out_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent / "duck-viewer.html"
+def parse_floats(text: str | None, default: str) -> list[float]:
+    return [float(x) for x in (text or default).split()]
 
-    blob = (REPO / "robotctl" / "assets" / "duck.bin").read_bytes()
-    magic, version = struct.unpack_from("<4sI", blob, 0)
+
+# ---- source: full-resolution MJCF + STL -------------------------------------
+
+def load_stl(path: Path):
+    """Binary STL → (n, 3, 3) float32 triangle corners. Meters, as exported."""
+    import numpy as np
+    data = path.read_bytes()
+    (n,) = struct.unpack_from("<I", data, 80)
+    if len(data) != 84 + n * 50:
+        raise SystemExit(f"{path}: not the binary STL this expects")
+    tris = np.frombuffer(data, dtype=np.uint8, offset=84).reshape(n, 50)
+    # Each record: normal (12 bytes, ignored — recomputed at render), 3 corners, pad.
+    return tris[:, 12:48].copy().view("<f4").reshape(n, 3, 3)
+
+
+def weld(tris):
+    """STL soup → indexed (verts (v, 3) f32, faces (f, 3) int).
+
+    Exact-duplicate welding only (to a 1 µm grid): the geometry stays the CAD's
+    own, this just stops every triangle from carrying three private vertices.
+    """
+    import numpy as np
+    flat = tris.reshape(-1, 3)
+    keys = np.round(flat * 1e6).astype(np.int64)
+    uniq, index, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
+    verts = flat[index].astype(np.float32)
+    faces = inverse.reshape(-1, 3)
+    if len(verts) > 0xFFFF:
+        raise SystemExit(f"mesh has {len(verts)} welded vertices; grow the index width")
+    return verts, faces
+
+
+def model_from_mjcf(mjcf_path: Path) -> dict:
+    root = ET.parse(mjcf_path).getroot()
+    mesh_dir = mjcf_path.parent / root.find("compiler").get("meshdir", ".")
+
+    files = {}  # asset name → STL file (name defaults to the file's stem)
+    for m in root.iter("mesh"):
+        file = m.get("file")
+        files[m.get("name") or Path(file).stem] = file
+    materials = {
+        m.get("name"): parse_floats(m.get("rgba"), "0.5 0.5 0.5 1")
+        for m in root.iter("material")
+    }
+
+    meshes: dict[str, tuple] = {}  # insertion order is the baked index space
+
+    def mesh_index(name: str) -> int:
+        if name not in meshes:
+            meshes[name] = weld(load_stl(mesh_dir / files[name]))
+        return list(meshes).index(name)
+
+    bodies: list[dict] = []
+    parts: list[dict] = []
+
+    def walk(body: ET.Element, parent: int) -> None:
+        index = len(bodies)
+        joint = body.find("joint")
+        bodies.append(
+            {
+                "parent": parent,
+                "pos": parse_floats(body.get("pos"), "0 0 0"),
+                "quat": parse_floats(body.get("quat"), "1 0 0 0"),
+                "joint": JOINT_NAMES.index(joint.get("name")) if joint is not None else -1,
+                "axis": parse_floats(joint.get("axis"), "0 0 1") if joint is not None else [0, 0, 0],
+            }
+        )
+        for geom in body.findall("geom"):
+            if geom.get("class") != "visual" or geom.get("type") != "mesh":
+                continue
+            name = geom.get("mesh")
+            parts.append(
+                {
+                    "body": index,
+                    "mesh": mesh_index(name),
+                    "rgba": materials.get(geom.get("material"), [0.5, 0.5, 0.5, 1]),
+                    "inner": name in INNER,
+                    "pos": parse_floats(geom.get("pos"), "0 0 0"),
+                    "quat": parse_floats(geom.get("quat"), "1 0 0 0"),
+                }
+            )
+        for child in body.findall("body"):
+            walk(child, index)
+
+    for top in root.find("worldbody").findall("body"):
+        walk(top, -1)
+
+    return {"meshes": list(meshes.values()), "bodies": bodies, "parts": parts}
+
+
+# ---- source: the committed terminal bake ------------------------------------
+
+def model_from_duck_bin(blob: bytes) -> dict:
+    """Parse bake-duck-mesh.py's FORMAT_VERSION 1 (see robotctl/src/duck.rs)."""
+    magic, version, n_mesh, n_body, n_part = struct.unpack_from("<4sIHHH", blob, 0)
     if magic != b"DUCK" or version != 1:
         raise SystemExit("duck.bin is not the format this viewer understands; "
                          "update this script alongside bake-duck-mesh.py")
+    at = 14
+    meshes = []
+    for _ in range(n_mesh):
+        nv, nf = struct.unpack_from("<HH", blob, at)
+        at += 4
+        verts = [struct.unpack_from("<3f", blob, at + i * 12) for i in range(nv)]
+        at += nv * 12
+        faces = [struct.unpack_from("<3H", blob, at + i * 6) for i in range(nf)]
+        at += nf * 6
+        meshes.append((verts, faces))
+    bodies = []
+    for _ in range(n_body):
+        parent, joint = struct.unpack_from("<hh", blob, at)
+        vals = struct.unpack_from("<10f", blob, at + 4)
+        at += 44
+        bodies.append({"parent": parent, "joint": joint,
+                       "pos": vals[0:3], "quat": vals[3:7], "axis": vals[7:10]})
+    parts = []
+    for _ in range(n_part):
+        body, mesh, r, g, b, _pad = struct.unpack_from("<HHBBBB", blob, at)
+        vals = struct.unpack_from("<7f", blob, at + 8)
+        at += 36
+        parts.append({"body": body, "mesh": mesh, "rgba": [r / 255, g / 255, b / 255, 1],
+                      "inner": False, "pos": vals[0:3], "quat": vals[3:7]})
+    return {"meshes": meshes, "bodies": bodies, "parts": parts}
 
-    ranges = joint_ranges(REPO / "kinematics" / "assets" / "alpha" / "robot_walk.xml")
+
+# ---- serialize for the page -------------------------------------------------
+# "DUK2": the viewer's own wire format, independent of duck.bin. Per mesh a u32
+# vertex/face count, f32 vertices, u16 indices; bodies and parts as in the v1
+# bake but with rgba and an "inner" flag on parts.
+
+def serialize(model: dict) -> bytes:
+    out = bytearray()
+    out += struct.pack("<4sIHHH", b"DUK2", 2,
+                       len(model["meshes"]), len(model["bodies"]), len(model["parts"]))
+    for verts, faces in model["meshes"]:
+        out += struct.pack("<II", len(verts), len(faces))
+        if hasattr(verts, "astype"):  # numpy, from the MJCF path
+            out += verts.astype("<f4").tobytes()
+            out += faces.astype("<u2").tobytes()
+        else:
+            for v in verts:
+                out += struct.pack("<3f", *v)
+            for f in faces:
+                out += struct.pack("<3H", *f)
+    for b in model["bodies"]:
+        out += struct.pack("<hh3f4f3f", b["parent"], b["joint"],
+                           *b["pos"], *b["quat"], *b["axis"])
+    for p in model["parts"]:
+        rgba = [min(255, max(0, round(c * 255))) for c in p["rgba"]]
+        out += struct.pack("<HH4B B 3x 3f 4f", p["body"], p["mesh"], *rgba,
+                           1 if p["inner"] else 0, *p["pos"], *p["quat"])
+    return bytes(out)
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    mjcf = Path(args.pop(0)).expanduser() if args and args[0].endswith(".xml") else None
+    out_path = Path(args[0]) if args else Path(__file__).parent / "duck-viewer.html"
+
+    if mjcf is not None:
+        try:
+            import numpy  # noqa: F401 — load_stl/weld need it; fail before parsing
+        except ImportError:
+            raise SystemExit("full-resolution mode needs numpy (pip install numpy)")
+        model = model_from_mjcf(mjcf)
+        ranges = joint_ranges(mjcf)
+        tris = sum(len(f) for _, f in model["meshes"])
+        source_note = f"フルCADメッシュ（{tris / 1000:.0f}k三角形） — {mjcf.name}"
+        dims_note = "寸法は現在のポーズの外接寸法（CAD原寸）。床グリッドは5cm。"
+    else:
+        model = model_from_duck_bin((REPO / "robotctl" / "assets" / "duck.bin").read_bytes())
+        ranges = joint_ranges(REPO / "kinematics" / "assets" / "alpha" / "robot_walk.xml")
+        source_note = "robotctl/assets/duck.bin — 端末モニタ用の間引きメッシュ"
+        dims_note = "寸法は現在のポーズの外接寸法（メッシュはデシメート済みのため±数mm）。床グリッドは5cm。"
 
     html = TEMPLATE
-    html = html.replace("__DUCK_B64__", base64.b64encode(blob).decode())
+    html = html.replace("__DUCK_B64__", base64.b64encode(serialize(model)).decode())
     html = html.replace("__JOINT_NAMES__", json.dumps(JOINT_NAMES))
     html = html.replace("__JOINT_RANGES__", json.dumps(ranges))
+    html = html.replace("__SOURCE_NOTE__", source_note)
+    html = html.replace("__DIMS_NOTE__", dims_note)
     out_path.write_text(html)
-    print(f"{out_path}: {out_path.stat().st_size / 1024:.0f} KB")
+    print(f"{out_path}: {out_path.stat().st_size / 1024 / 1024:.1f} MB")
 
 
 # The page itself. Kept as one template string so the tool stays a single file;
@@ -229,21 +415,22 @@ TEMPLATE = r"""<title>Microduck Assy Viewer</title>
 
 <div class="panel" id="head">
   <h1>Microduck Assy Viewer</h1>
-  <div class="sub">robotctl/assets/duck.bin — ポリシーが学習した視覚モデル</div>
+  <div class="sub">__SOURCE_NOTE__</div>
   <div id="dims">
     <div class="cell"><div class="k">全高</div><div class="v" id="d-h">—<small>mm</small></div></div>
     <div class="cell"><div class="k">質量</div><div class="v">約800<small>g</small></div></div>
     <div class="cell"><div class="k">全幅</div><div class="v" id="d-w">—<small>mm</small></div></div>
     <div class="cell"><div class="k">奥行</div><div class="v" id="d-d">—<small>mm</small></div></div>
   </div>
-  <div class="note">寸法は現在のポーズの外接寸法（メッシュはデシメート済みのため±数mm）。床グリッドは5cm。</div>
+  <div class="note">__DIMS_NOTE__</div>
 </div>
 
-<div class="panel" id="chips" role="group" aria-label="スケール比較オブジェクト">
+<div class="panel" id="chips" role="group" aria-label="表示オプション">
   <button class="chip" data-ref="can" aria-pressed="true">350ml缶</button>
   <button class="chip" data-ref="bottle" aria-pressed="false">500mlペットボトル</button>
   <button class="chip" data-ref="phone" aria-pressed="false">スマートフォン</button>
   <button class="chip" data-ref="ruler" aria-pressed="true">スケール（cm）</button>
+  <button class="chip" id="xray" aria-pressed="false">透視</button>
 </div>
 
 <div class="panel" id="joints">
@@ -261,8 +448,8 @@ TEMPLATE = r"""<title>Microduck Assy Viewer</title>
 <script>
 "use strict";
 
-// ---- baked model ------------------------------------------------------------
-// Format: scripts/bake-duck-mesh.py, FORMAT_VERSION 1 (see robotctl/src/duck.rs).
+// ---- embedded model ---------------------------------------------------------
+// "DUK2", written by scripts/duck-viewer.py — see serialize() there.
 const JOINT_NAMES = __JOINT_NAMES__;
 const JOINT_RANGES = __JOINT_RANGES__;
 const DUCK_B64 = "__DUCK_B64__";
@@ -273,20 +460,20 @@ function parseDuck(b64) {
   let at = 0;
   const u16 = () => { const v = dv.getUint16(at, true); at += 2; return v; };
   const i16 = () => { const v = dv.getInt16(at, true); at += 2; return v; };
+  const u32 = () => { const v = dv.getUint32(at, true); at += 4; return v; };
   const f32 = () => { const v = dv.getFloat32(at, true); at += 4; return v; };
   const vec3 = () => [f32(), f32(), f32()];
   const quat = () => [f32(), f32(), f32(), f32()]; // MJCF order: w x y z
 
-  if (String.fromCharCode(...bytes.slice(0, 4)) !== "DUCK") throw new Error("bad magic");
+  if (String.fromCharCode(...bytes.slice(0, 4)) !== "DUK2") throw new Error("bad magic");
   at = 4;
-  if (dv.getUint32(at, true) !== 1) throw new Error("bad version");
-  at = 8;
+  if (u32() !== 2) throw new Error("bad version");
   const nMesh = u16(), nBody = u16(), nPart = u16();
 
   const meshes = [];
   for (let m = 0; m < nMesh; m++) {
-    const nv = u16(), nf = u16();
-    // Copy out (slice) rather than view: offsets are not 4-byte aligned.
+    const nv = u32(), nf = u32();
+    // Copy out (slice) rather than view: offsets are not element-aligned.
     const verts = new Float32Array(bytes.buffer.slice(at, at + nv * 12)); at += nv * 12;
     const faces = new Uint16Array(bytes.buffer.slice(at, at + nf * 6)); at += nf * 6;
     meshes.push({ verts, faces });
@@ -298,8 +485,10 @@ function parseDuck(b64) {
   const parts = [];
   for (let p = 0; p < nPart; p++) {
     const body = u16(), mesh = u16();
-    const rgb = [bytes[at], bytes[at + 1], bytes[at + 2]]; at += 4;
-    parts.push({ body, mesh, rgb, pos: vec3(), quat: quat() });
+    const rgba = [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]];
+    const inner = bytes[at + 4] === 1;
+    at += 8;
+    parts.push({ body, mesh, rgba, inner, pos: vec3(), quat: quat() });
   }
   return { meshes, bodies, parts };
 }
@@ -327,7 +516,7 @@ fill.position.set(-0.8, 0.4, -0.6);
 scene.add(fill);
 
 // Grids live in Three's y-up world; the robot group is rotated from MJCF z-up.
-const themed = []; // objects rebuilt/recoloured when the theme flips
+const themed = []; // objects recoloured/redrawn when the theme flips
 function cssColor(name) {
   return new THREE.Color(getComputedStyle(document.documentElement).getPropertyValue(name).trim());
 }
@@ -357,12 +546,12 @@ const geometries = duck.meshes.map(({ verts, faces }) => {
   let g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.BufferAttribute(verts, 3));
   g.setIndex(new THREE.BufferAttribute(faces, 1));
-  g = g.toNonIndexed(); // flat facets: the honest look for a decimated CAD shell
+  g = g.toNonIndexed(); // flat facets: CAD's own faces, no invented smoothing
   g.computeVertexNormals();
   return g;
 });
 
-// Parents precede children in the bake's order, so one forward pass builds the tree.
+// Parents precede children in the source's order, so one forward pass builds the tree.
 const bodyGroups = [];
 for (const b of duck.bodies) {
   const group = new THREE.Group();
@@ -371,16 +560,35 @@ for (const b of duck.bodies) {
   bodyGroups.push(group);
 }
 
+const outerMats = [], innerMats = [];
 for (const p of duck.parts) {
   const mat = new THREE.MeshPhongMaterial({
-    color: new THREE.Color(p.rgb[0] / 255, p.rgb[1] / 255, p.rgb[2] / 255),
+    color: new THREE.Color(p.rgba[0] / 255, p.rgba[1] / 255, p.rgba[2] / 255),
     shininess: 22,
   });
+  if (p.rgba[3] < 250) {
+    mat.transparent = true;
+    mat.opacity = p.rgba[3] / 255;
+  }
+  (p.inner ? innerMats : outerMats).push(mat);
   const mesh = new THREE.Mesh(geometries[p.mesh], mat);
   mesh.position.set(...p.pos);
   mesh.quaternion.set(p.quat[1], p.quat[2], p.quat[3], p.quat[0]);
   bodyGroups[p.body].add(mesh);
 }
+
+// X-ray: the shells go to glass so the electronics inside read at a glance.
+const baseOpacity = outerMats.map((m) => (m.transparent ? m.opacity : 1));
+document.getElementById("xray").addEventListener("click", (e) => {
+  const on = e.currentTarget.getAttribute("aria-pressed") !== "true";
+  e.currentTarget.setAttribute("aria-pressed", String(on));
+  outerMats.forEach((m, i) => {
+    m.transparent = on || baseOpacity[i] < 1;
+    m.opacity = on ? Math.min(0.28, baseOpacity[i]) : baseOpacity[i];
+    m.depthWrite = !on;
+    m.needsUpdate = true;
+  });
+});
 
 const angles = new Array(JOINT_NAMES.length).fill(0);
 const tmpQ = new THREE.Quaternion();
