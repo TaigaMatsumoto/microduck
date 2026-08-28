@@ -265,6 +265,12 @@ def build_usdz(bodies, files, mesh_dir: Path, frames, out_path: Path) -> None:
             op.Set(mat, Usd.TimeCode(f))
         for j, p in enumerate(b["parts"]):
             tris = mesh_tris(p["mesh"])
+            # The STL winding is inconsistent and RealityKit (Quick Look's
+            # renderer) ignores doubleSided, culling every back-wound face into
+            # a hole. Emitting each triangle in both windings is the reliable
+            # both-sides: with culling on, exactly one copy faces the camera,
+            # so there is no z-fight and each side lights by its own normal.
+            tris = np.concatenate([tris, tris[:, ::-1]])
             total += len(tris)
             prim = UsdGeom.Mesh.Define(stage, f"/Duck/{sanitize(b['name'])}/part{j}")
             local = Gf.Matrix4d().SetTransform(
