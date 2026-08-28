@@ -754,7 +754,8 @@ TEMPLATE = r"""<meta charset="utf-8">
       <button class="simbtn" id="ar-photo" aria-pressed="false">写真</button>
       <button class="simbtn" id="ar-cam" aria-pressed="false">ライブ</button>
       <button class="simbtn wide" id="ar-off" aria-pressed="true">AR オフ</button>
-      <a class="simbtn wide" id="ar-usdz" rel="ar" hidden>iPhone AR — 実寸で床に置く（Quick Look）</a>
+      <button class="simbtn wide" id="ar-gyro" aria-pressed="false" hidden>ジャイロ追従（タップで配置）</button>
+      <a class="simbtn wide" id="ar-usdz" rel="ar" hidden>iPhone AR — 実寸で床に置く（Quick Look・再生のみ）</a>
       <button class="simbtn wide" id="ar-open" hidden>別タブで開く（ライブカメラ用）</button>
       <button class="simbtn wide" id="ar-xr" hidden>WebXR AR（実寸でその場に置く）</button>
       <button class="simbtn wide" id="ar-grid" aria-pressed="true">床グリッド表示</button>
@@ -769,6 +770,10 @@ TEMPLATE = r"""<meta charset="utf-8">
     <div class="hintline" id="ar-diag"></div>
     <input type="file" id="ar-file" accept="image/*" hidden>
     <input type="file" id="ar-capture" accept="image/*" capture="environment" hidden>
+    <div class="row" id="ar-height-row" hidden>
+      <label>カメラ高さ<input id="ar-height" type="range" min="0.3" max="1.8" step="0.05" value="1.0" aria-label="カメラの床からの高さ"></label>
+      <span class="deg" id="ar-height-v">1.00m</span>
+    </div>
     <div class="hintline">撮影＝その場でカメラ撮影して重ねる（権限不要・スマホ推奨） ／ 写真＝保存済み画像 ／ ライブ＝カメラ映像（ブラウザの権限が必要）</div>
     <div class="hintline" id="ar-hint" style="display:none">端末や写真を固定し、ドラッグ／ホイールで視点を実写の床に合わせてください。グリッドが合ったら非表示に。</div>
     <h3>頭コマンド</h3>
@@ -1148,6 +1153,14 @@ canvas.addEventListener("pointerdown", (e) => {
 });
 canvas.addEventListener("pointermove", (e) => {
   if (!drag) return;
+  if (gyroOn) {
+    // Gyro owns the view; a vertical drag tunes the camera height instead,
+    // since the slider sits inside the collapsed panel.
+    const dyg = e.clientY - drag.y;
+    drag.x = e.clientX; drag.y = e.clientY;
+    setCamHeight(camHeight - dyg * 0.003);
+    return;
+  }
   const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
   drag.x = e.clientX; drag.y = e.clientY;
   if (drag.pan) {
@@ -1411,6 +1424,10 @@ function applyAr(mode) {
   document.getElementById("ar-photo").setAttribute("aria-pressed", String(mode === "photo"));
   document.getElementById("ar-shot").setAttribute("aria-pressed", String(mode === "photo"));
   document.getElementById("ar-off").setAttribute("aria-pressed", String(mode === "off"));
+  // Gyro tracking rides the live camera only; a photo cannot follow the phone.
+  document.getElementById("ar-gyro").hidden = mode !== "cam";
+  if (mode !== "cam" && gyroOn) setGyro(false);
+  if (mode === "off") simWorld.position.set(0, 0, 0);
   applyTheme();
 }
 
@@ -1507,6 +1524,100 @@ arGridBtn.addEventListener("click", () => {
   gridMinor.visible = showGrid;
 });
 
+// ---- gyro AR: interactive AR for phones without WebXR -----------------------
+// Live camera behind the canvas + the device's orientation driving the view =
+// rotational tracking (look around; walking with the phone won't parallax).
+// A tap projects through the camera onto the virtual floor and puts the duck
+// there — the same placement gesture WebXR uses, driving the same live sim.
+const gyroBtn = document.getElementById("ar-gyro");
+const heightRow = document.getElementById("ar-height-row");
+let gyroOn = false;
+let camHeight = 1.0;
+const gyroQuat = new THREE.Quaternion();
+let gyroSeen = false;
+{
+  const euler = new THREE.Euler();
+  const qNeg90X = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+  const zee = new THREE.Vector3(0, 0, 1);
+  const qScreen = new THREE.Quaternion();
+  const screenAngle = () =>
+    ((screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0) * Math.PI / 180;
+  window.__onDevOrient = (e) => {
+    if (e.alpha == null) return;
+    gyroSeen = true;
+    euler.set(
+      THREE.MathUtils.degToRad(e.beta),
+      THREE.MathUtils.degToRad(e.alpha),
+      -THREE.MathUtils.degToRad(e.gamma),
+      "YXZ",
+    );
+    gyroQuat.setFromEuler(euler);
+    gyroQuat.multiply(qNeg90X);
+    gyroQuat.multiply(qScreen.setFromAxisAngle(zee, -screenAngle()));
+  };
+}
+async function setGyro(on) {
+  if (on) {
+    try {
+      if (typeof DeviceOrientationEvent !== "undefined"
+          && typeof DeviceOrientationEvent.requestPermission === "function") {
+        if (await DeviceOrientationEvent.requestPermission() !== "granted") {
+          arHint.style.display = "block";
+          arHint.textContent = "ジャイロの利用が許可されませんでした。";
+          return;
+        }
+      }
+      addEventListener("deviceorientation", window.__onDevOrient);
+    } catch (e) {
+      arHint.style.display = "block";
+      arHint.textContent = "この端末ではジャイロを利用できません。";
+      return;
+    }
+  } else {
+    removeEventListener("deviceorientation", window.__onDevOrient);
+  }
+  gyroOn = on;
+  gyroBtn.setAttribute("aria-pressed", String(on));
+  heightRow.hidden = !on;
+  if (on) {
+    arHint.style.display = "block";
+    arHint.textContent = "端末をかざして見回せます。床グリッドを実際の床に重ねる高さに「カメラ高さ」を合わせ、画面タップでその場所にダックを置いて、ミニ操作ボタンで歩かせてください。";
+    // The panel otherwise covers the very floor the user needs to tap.
+    setPanelCollapsed(true);
+  } else {
+    placeCamera();
+  }
+}
+gyroBtn.addEventListener("click", () => setGyro(!gyroOn));
+function setCamHeight(v) {
+  camHeight = Math.min(1.8, Math.max(0.3, v));
+  document.getElementById("ar-height").value = camHeight;
+  document.getElementById("ar-height-v").textContent = `${camHeight.toFixed(2)}m`;
+}
+document.getElementById("ar-height").addEventListener("input", (e) => {
+  setCamHeight(parseFloat(e.target.value));
+});
+// Tap-to-place: a short, non-drag touch while gyro AR is on.
+let tapStart = null;
+canvas.addEventListener("pointerdown", (e) => { tapStart = { x: e.clientX, y: e.clientY }; });
+canvas.addEventListener("pointerup", (e) => {
+  if (!gyroOn || !simActive || !sim || !tapStart) return;
+  if (Math.abs(e.clientX - tapStart.x) > 8 || Math.abs(e.clientY - tapStart.y) > 8) return;
+  const ndc = new THREE.Vector2(
+    (e.clientX / innerWidth) * 2 - 1,
+    -(e.clientY / innerHeight) * 2 + 1,
+  );
+  const ray = new THREE.Raycaster();
+  ray.setFromCamera(ndc, camera);
+  const dir = ray.ray.direction;
+  if (dir.y >= -1e-4) return; // pointing at the sky
+  const t = -ray.ray.origin.y / dir.y;
+  const pt = ray.ray.origin.clone().addScaledVector(dir, t);
+  // Land the duck itself on the tapped point (MJCF z-up → world x, -z).
+  simWorld.position.x = pt.x - sim.qpos[0];
+  simWorld.position.z = pt.z + sim.qpos[1];
+});
+
 // ---- iPhone AR (Quick Look) -------------------------------------------------
 // iOS has no WebXR; instead a usdz with the walk baked in (scripts/
 // bake-duck-usdz.py) opens in the native AR viewer at true scale.
@@ -1525,13 +1636,15 @@ const USDZ_URL = "__USDZ_URL__";
 // Small screens are exactly where the AR modes run; the folded bar keeps
 // drive/turn/stop reachable while the picture stays visible.
 const simMin = document.getElementById("simmin");
-simMin.addEventListener("click", () => {
-  const panel = document.getElementById("simpanel");
-  const collapsed = panel.classList.toggle("collapsed");
+function setPanelCollapsed(collapsed) {
+  document.getElementById("simpanel").classList.toggle("collapsed", collapsed);
   document.getElementById("minictrl").hidden = !collapsed;
   simMin.textContent = collapsed ? "＋" : "－";
   simMin.setAttribute("aria-expanded", String(!collapsed));
   simMin.setAttribute("aria-label", collapsed ? "パネルを開く" : "パネルを最小化");
+}
+simMin.addEventListener("click", () => {
+  setPanelCollapsed(!document.getElementById("simpanel").classList.contains("collapsed"));
 });
 
 // ---- WebXR AR (hit-test placement, true scale) ------------------------------
@@ -1757,6 +1870,10 @@ renderer.setAnimationLoop((now, frame) => {
   if (renderer.xr.isPresenting) xrFrameUpdate(frame);
   if (simActive && sim) simFrame(now);
   else simPrev = null;
+  if (gyroOn && gyroSeen && !renderer.xr.isPresenting) {
+    camera.position.set(0, camHeight, 0);
+    camera.quaternion.copy(gyroQuat);
+  }
   renderer.render(scene, camera);
 });
 </script>
